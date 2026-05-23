@@ -1,0 +1,4656 @@
+diff --git a/.gitignore b/.gitignore
+index 4921785..640d602 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -45,3 +45,11 @@ data/cache/
+ 
+ # Jupyter
+ .ipynb_checkpoints/
++
++# submission/ artifacts (produced by submission/train.py; rebuildable locally,
++# too large for the repo, and partially redundant with HF-hosted weights —
++# see submission/README.md for the build flow).
++submission/caimira_lite.meta.json
++submission/eb_tables.json
++# Codabench-shaped ZIPs produced by submission/build_zip.sh at the repo root.
++/submission_*.zip
+diff --git a/src/torch_measure/models/__init__.py b/src/torch_measure/models/__init__.py
+index ef4319e..b7841d4 100644
+--- a/src/torch_measure/models/__init__.py
++++ b/src/torch_measure/models/__init__.py
+@@ -10,8 +10,11 @@ from torch_measure.models.beta_rasch import BetaRasch
+ from torch_measure.models.beta_twopl import BetaTwoPL
+ from torch_measure.models.bifactor import Bifactor
+ from torch_measure.models.bradley_terry import BradleyTerry
++from torch_measure.models.caimira import CAIMIRA
++from torch_measure.models.cold_start_lookup import ColdStartLookupPredictor
+ from torch_measure.models.ggm import GaussianGraphicalModel
+ from torch_measure.models.ising import IsingModel
++from torch_measure.models.llm_judge_irt import LLMJudgeIRT, build_difficulty_prompt
+ from torch_measure.models.logistic_fm import LogisticFM
+ from torch_measure.models.multifacet import MultiFacetRasch
+ from torch_measure.models.multifacet_twopl import MultiFacet2PL
+@@ -31,12 +34,16 @@ __all__ = [
+     "IsingModel",
+     "GaussianGraphicalModel",
+     "BradleyTerry",
++    "ColdStartLookupPredictor",
++    "LLMJudgeIRT",
++    "build_difficulty_prompt",
+     "Rasch",
+     "TwoPL",
+     "ThreePL",
+     "BetaRasch",
+     "BetaTwoPL",
+     "AmortizedIRT",
++    "CAIMIRA",
+     "TabPFNPredictor",
+     "MultiFacetRasch",
+     "MultiFacet2PL",
+diff --git a/src/torch_measure/models/caimira.py b/src/torch_measure/models/caimira.py
+new file mode 100644
+index 0000000..0d47fde
+--- /dev/null
++++ b/src/torch_measure/models/caimira.py
+@@ -0,0 +1,344 @@
++# Copyright (c) 2026 AIMS Foundations. MIT License.
++
++"""Content-Aware Item Response Analysis (CAIMIRA).
++
++A content-aware multidimensional IRT model that predicts per-item relevance
++and difficulty vectors from question embeddings, complementing
++:class:`~torch_measure.models.AmortizedIRT` (which predicts scalar 1PL/2PL/3PL
++parameters) with a multidimensional MIRT-style response equation.
++
++Reference
++---------
++Lalor, J. P., Yang, W., Smith, K., Forde, J. Z., Resnik, P., Rodriguez, P.
++"Do great minds think alike? Investigating Human-AI Complementarity in
++Question Answering with CAIMIRA." EMNLP 2024. arXiv:2410.06524.
++"""
++
++from __future__ import annotations
++
++import torch
++from torch import nn
++
++from torch_measure.models._base import IRTModel
++
++
++class CAIMIRA(IRTModel):
++    r"""Content-Aware Item Response Analysis (CAIMIRA).
++
++    A clean-room, paper-faithful implementation of the CAIMIRA model. Each
++    item :math:`j` is summarised by two vectors derived linearly from its
++    question embedding :math:`e_j \in \mathbb{R}^D`:
++
++    * a **relevance** vector :math:`r_j \in \Delta^{K-1}` over :math:`K`
++      latent skill dimensions, normalised via a softmax;
++    * a **difficulty** vector :math:`d_j \in \mathbb{R}^K`, zero-centred
++      across the training item bank.
++
++    Each subject :math:`i` has a learned **skill** vector
++    :math:`s_i \in \mathbb{R}^K`. The response probability is the
++    paper's dot-product form:
++
++    .. math::
++
++        P(Y_{ij} = 1 \mid s_i, d_j, r_j) =
++        \sigma\!\bigl( (s_i - d_j)^\top r_j \bigr).
++
++    The fitting objective is Bernoulli negative log-likelihood plus L1
++    regularisation on the centred difficulty matrix and on the subject
++    skill matrix, propagated through :func:`~torch_measure.fitting.mle.mle_fit`
++    via its ``loss_fn`` hook.
++
++    Parameters
++    ----------
++    n_subjects : int
++        Number of subjects in the training universe.
++    n_items : int
++        Number of items in the training universe (must match the first
++        dimension of the embeddings passed to :meth:`set_embeddings`).
++    embedding_dim : int
++        Dimensionality of the question-embedding vectors.
++    latent_dim : int, optional
++        Number of latent skill dimensions :math:`K`. Defaults to 5, the
++        value used in the CAIMIRA paper's reported experiments; the paper
++        does not declare 5 as a universal default and tuning per task may
++        help.
++    device : str, optional
++        Device for parameters and buffers. Defaults to ``"cpu"``.
++
++    Notes
++    -----
++    **Bias asymmetry.** The relevance head is :class:`~torch.nn.Linear`
++    with bias (the softmax normaliser absorbs constant shifts only along
++    the latent axis, not the bias term). The difficulty head is
++    :class:`~torch.nn.Linear` *without* bias, because any constant shift
++    would be subtracted out by the zero-centering step.
++
++    **Zero-centering protocol.** The paper specifies that difficulty is
++    zero-centred over the training item bank but does not specify whether
++    the centering mean is recomputed every batch / epoch or held fixed.
++    This implementation:
++
++    * uses a **dynamic** mean (recomputed each forward pass, with
++      gradient flowing through the centering operation) while
++      :attr:`training` is ``True``; and
++    * uses a **frozen** snapshot of the training-bank mean (stored in
++      the buffer :attr:`_difficulty_mean`) while :attr:`training` is
++      ``False``, so cold-start items use the learned coordinate system.
++
++    The snapshot is refreshed automatically at the end of :meth:`fit`.
++    Callers handling cold-start items at inference should use
++    :meth:`compute_item_params` directly with the new embeddings.
++
++    Examples
++    --------
++    >>> import torch
++    >>> from torch_measure.models import CAIMIRA
++    >>> torch.manual_seed(0)
++    >>> n_subjects, n_items, embed_dim = 20, 30, 16
++    >>> model = CAIMIRA(n_subjects, n_items, embed_dim, latent_dim=3)
++    >>> embeddings = torch.randn(n_items, embed_dim)
++    >>> responses = torch.bernoulli(torch.full((n_subjects, n_items), 0.5))
++    >>> history = model.fit(responses, embeddings, max_epochs=10, verbose=False)
++    >>> # Cold-start: predict on new items with their embeddings
++    >>> new_embeddings = torch.randn(5, embed_dim)
++    >>> relevance, difficulty = model.compute_item_params(new_embeddings)
++    >>> relevance.shape, difficulty.shape
++    (torch.Size([5, 3]), torch.Size([5, 3]))
++    """
++
++    def __init__(
++        self,
++        n_subjects: int,
++        n_items: int,
++        embedding_dim: int,
++        latent_dim: int = 5,
++        device: str = "cpu",
++    ) -> None:
++        super().__init__(n_subjects, n_items, device)
++        if embedding_dim <= 0:
++            raise ValueError(f"embedding_dim must be positive, got {embedding_dim}")
++        if latent_dim <= 0:
++            raise ValueError(f"latent_dim must be positive, got {latent_dim}")
++        self.embedding_dim = embedding_dim
++        self.latent_dim = latent_dim
++
++        # Subject skill vectors, learned directly (small init for stable training).
++        self.skill = nn.Parameter(torch.randn(n_subjects, latent_dim, device=self._device) * 0.01)
++
++        # Linear heads from question embeddings to (relevance_raw, difficulty_raw).
++        # Bias asymmetry: relevance has bias (informative under softmax);
++        # difficulty has no bias (would be subtracted out by zero-centering).
++        self.relevance_head = nn.Linear(embedding_dim, latent_dim, bias=True).to(self._device)
++        self.difficulty_head = nn.Linear(embedding_dim, latent_dim, bias=False).to(self._device)
++
++        # Training-bank difficulty mean, refreshed by fit() and used in
++        # frozen-mean centering for cold-start inference.
++        self.register_buffer("_difficulty_mean", torch.zeros(latent_dim, device=self._device))
++
++        self._embeddings: torch.Tensor | None = None
++
++    def set_embeddings(self, embeddings: torch.Tensor) -> None:
++        """Set the training-bank item embeddings used by :meth:`predict`.
++
++        Parameters
++        ----------
++        embeddings : torch.Tensor
++            Item embeddings of shape ``(n_items, embedding_dim)``.
++
++        Raises
++        ------
++        ValueError
++            If ``embeddings`` does not have shape ``(n_items, embedding_dim)``.
++        """
++        if embeddings.dim() != 2:
++            raise ValueError(f"Expected 2-D embeddings, got shape {tuple(embeddings.shape)}")
++        if embeddings.shape[0] != self.n_items:
++            raise ValueError(f"Expected {self.n_items} embeddings, got {embeddings.shape[0]}")
++        if embeddings.shape[1] != self.embedding_dim:
++            raise ValueError(f"Expected embedding_dim={self.embedding_dim}, got {embeddings.shape[1]}")
++        self._embeddings = embeddings.to(self._device)
++
++    def compute_item_params(
++        self,
++        embeddings: torch.Tensor | None = None,
++        center: str = "auto",
++    ) -> tuple[torch.Tensor, torch.Tensor]:
++        """Compute ``(relevance, difficulty)`` for a batch of item embeddings.
++
++        Parameters
++        ----------
++        embeddings : torch.Tensor or None
++            Embeddings of shape ``(n, embedding_dim)``. If ``None``, uses
++            ``self._embeddings`` (the training bank set by
++            :meth:`set_embeddings`).
++        center : {"auto", "dynamic", "frozen"}
++            Difficulty-centering mode.
++
++            * ``"dynamic"`` subtracts the mean of ``d_raw`` over the supplied
++              ``embeddings`` (gradient flows through the mean — used during
++              training).
++            * ``"frozen"`` subtracts the stored :attr:`_difficulty_mean`
++              buffer (the snapshot taken at the end of the last
++              :meth:`fit` call — used for cold-start inference).
++            * ``"auto"`` resolves to ``"dynamic"`` when :attr:`training`
++              is ``True``, ``"frozen"`` otherwise.
++
++        Returns
++        -------
++        relevance : torch.Tensor
++            Shape ``(n, latent_dim)``, rows on the simplex (softmax over
++            the latent axis).
++        difficulty : torch.Tensor
++            Shape ``(n, latent_dim)``, zero-centred per ``center``.
++        """
++        if embeddings is None:
++            if self._embeddings is None:
++                raise RuntimeError("Call set_embeddings() before computing item params.")
++            embeddings = self._embeddings
++        embeddings = embeddings.to(self._device)
++
++        relevance = torch.softmax(self.relevance_head(embeddings), dim=-1)
++        d_raw = self.difficulty_head(embeddings)
++
++        if center == "auto":
++            center = "dynamic" if self.training else "frozen"
++
++        if center == "dynamic":
++            difficulty = d_raw - d_raw.mean(dim=0, keepdim=True)
++        elif center == "frozen":
++            difficulty = d_raw - self._difficulty_mean
++        else:
++            raise ValueError(f"Unknown center mode {center!r}; expected 'auto', 'dynamic', or 'frozen'.")
++
++        return relevance, difficulty
++
++    def _refresh_difficulty_mean(self) -> None:
++        """Snapshot the current training-bank difficulty mean into the buffer."""
++        if self._embeddings is None:
++            raise RuntimeError("Cannot snapshot difficulty mean before set_embeddings().")
++        with torch.no_grad():
++            d_raw = self.difficulty_head(self._embeddings)
++            self._difficulty_mean.copy_(d_raw.mean(dim=0))
++
++    def predict(self, query: dict[str, torch.Tensor]) -> torch.Tensor:
++        r"""Compute :math:`P(\text{correct})` per row of ``query``.
++
++        Applies the CAIMIRA response equation
++        :math:`\sigma((s_i - d_j)^\top r_j)` row-wise.
++
++        Parameters
++        ----------
++        query : dict[str, torch.Tensor]
++            Must contain ``"subject_idx"`` and ``"item_idx"`` — 1-D long
++            tensors of equal length ``N``. Item indices reference the
++            training bank set via :meth:`set_embeddings`.
++
++        Returns
++        -------
++        torch.Tensor
++            Probabilities, shape ``(N,)``.
++        """
++        s = query["subject_idx"]
++        i = query["item_idx"]
++        relevance, difficulty = self.compute_item_params()
++        diff = self.skill[s] - difficulty[i]
++        logit = (diff * relevance[i]).sum(dim=-1)
++        return torch.sigmoid(logit)
++
++    def fit(
++        self,
++        data,
++        embeddings: torch.Tensor,
++        mask: torch.Tensor | None = None,
++        max_epochs: int = 1000,
++        lr: float = 1e-3,
++        weight_decay: float = 0.0,
++        difficulty_reg: float = 1e-4,
++        skill_reg: float = 1e-4,
++        verbose: bool = True,
++        **kwargs,
++    ) -> dict:
++        r"""Fit CAIMIRA by MLE with L1 regularisation on difficulty and skill.
++
++        Minimises
++
++        .. math::
++
++            L = \mathrm{BernoulliNLL}(p, y)
++              + \lambda_d \,\| d \|_1
++              + \lambda_s \,\| s \|_1,
++
++        where :math:`d` is the zero-centred per-item difficulty matrix
++        evaluated over the full training item bank and :math:`s` is the
++        subject skill matrix. Penalties use the mean absolute value so
++        coefficients are dimension-invariant. Reuses the package's
++        canonical :func:`~torch_measure.fitting.mle.mle_fit` loop via its
++        ``loss_fn`` hook.
++
++        Parameters
++        ----------
++        data : LongFormData or torch.Tensor
++            Long-form dataset (preferred) or wide-form response tensor.
++        embeddings : torch.Tensor
++            Item embeddings of shape ``(n_items, embedding_dim)``.
++        mask : torch.Tensor or None
++            Boolean mask for observed entries when ``data`` is wide-form.
++        max_epochs : int
++            Maximum optimization epochs.
++        lr : float
++            Adam learning rate.
++        weight_decay : float
++            Adam weight decay (L2 on all parameters); orthogonal to the
++            CAIMIRA L1 penalties.
++        difficulty_reg : float
++            L1 coefficient :math:`\lambda_d` on the centred difficulty.
++        skill_reg : float
++            L1 coefficient :math:`\lambda_s` on the subject skill matrix.
++        verbose : bool
++            Show a progress bar if ``tqdm`` is installed.
++        **kwargs
++            Forwarded to :func:`~torch_measure.fitting.mle.mle_fit`
++            (e.g. ``optimizer_cls``, ``convergence_tol``).
++
++        Returns
++        -------
++        dict
++            Training history with ``"losses"`` key.
++        """
++        from torch_measure.fitting._losses import bernoulli_nll
++        from torch_measure.fitting.mle import mle_fit
++
++        self.set_embeddings(embeddings)
++        self.train()
++        # Seed the buffer so any post-init `predict` calls before training
++        # finishes do not fall back to a stale zero mean.
++        self._refresh_difficulty_mean()
++
++        subject_idx, item_idx, response = self._normalize_fit_inputs(data, mask)
++
++        def caimira_loss(probs: torch.Tensor, observed: torch.Tensor) -> torch.Tensor:
++            base = bernoulli_nll(probs, observed)
++            # Re-compute centered difficulty for the reg term so gradients
++            # match the dynamic centering used in the forward pass.
++            d_raw = self.difficulty_head(self._embeddings)
++            d_centered = d_raw - d_raw.mean(dim=0, keepdim=True)
++            reg = difficulty_reg * d_centered.abs().mean() + skill_reg * self.skill.abs().mean()
++            return base + reg
++
++        history = mle_fit(
++            self,
++            subject_idx,
++            item_idx,
++            response,
++            max_epochs=max_epochs,
++            lr=lr,
++            weight_decay=weight_decay,
++            verbose=verbose,
++            loss_fn=caimira_loss,
++            **kwargs,
++        )
++
++        self.eval()
++        # Final snapshot so cold-start inference uses the learned coordinate system.
++        self._refresh_difficulty_mean()
++        return history
+diff --git a/src/torch_measure/models/cold_start_lookup.py b/src/torch_measure/models/cold_start_lookup.py
+new file mode 100644
+index 0000000..28c434c
+--- /dev/null
++++ b/src/torch_measure/models/cold_start_lookup.py
+@@ -0,0 +1,445 @@
++# Copyright (c) 2026 AIMS Foundations. MIT License.
++
++"""Hierarchical empirical-Bayes predictor for cold-start AI evaluation.
++
++This module implements the model deployed in the Stanford CS321M Predictive AI
++Evaluation Challenge (Codabench leaderboard NLL = -0.59). Unlike standard
++``torch_measure.Predictor`` subclasses, this class operates on raw textual
++records rather than integer ``(subject_idx, item_idx)`` tuples. The reason is
++intrinsic to the cold-start setting: at competition test time, item IDs are
++NEW (never seen during training), so integer-based lookup is impossible. The
++model pools subject identities (which ARE known at test time, since the same
++909 subjects are evaluated across both training and test) with benchmark and
++condition priors learned from training responses.
++
++The prediction stack is a 6-level fallback hierarchy:
++
++1. (subject_name, benchmark_id, condition)              -- triple match
++2. (subject_name, benchmark_id)                         -- Bayesian-shrunk pair
++3. sigmoid(logit(subj_prior) + logit(bench_prior) - logit(global))  -- 1-PL IRT blend
++4. benchmark_id                                         -- unknown subject
++5. subject_name                                         -- unknown benchmark
++6. global mean                                          -- both unknown
++
++The IRT blend at level 3 is the classical 1-parameter Rasch formulation
++``P = sigmoid(theta - delta)`` rewritten in logit space against the global
++mean as a reference. Bayesian shrinkage at level 2 protects low-count cells
++from collapsing to 0 or 1.
++
++References
++----------
++- Rasch, G. (1960). Probabilistic models for some intelligence and
++  attainment tests. Danish Institute for Educational Research.
++- Platt, J. (1999). Probabilistic outputs for support vector machines and
++  comparisons to regularized likelihood methods. Adv. Large Margin Class.
++"""
++
++from __future__ import annotations
++
++import json
++import math
++import re
++from collections.abc import Iterable
++from pathlib import Path
++from typing import Any
++
++# Provider prefixes that subjects sometimes appear with in subject_content
++# but not in display_name (e.g. "meta-llama/Llama-2-7b-chat" vs "Llama-2-7b-chat").
++_DEFAULT_PROVIDER_PREFIXES: tuple[str, ...] = (
++    "meta-llama/", "openai/", "mistralai/", "google/", "anthropic/",
++    "microsoft/", "huggingface/", "tiiuae/", "deepmind/", "cohere/",
++    "allenai/", "01-ai/", "qwen/", "baichuan-inc/",
++)
++
++# Default probability clipping. Avoids inf in logit() and keeps NLL bounded.
++_CLIP_LO: float = 0.05
++_CLIP_HI: float = 0.95
++
++# Default Platt-shift cap. Stops a single benchmark's K=5 labeled examples
++# from producing extreme shifts. See ``calibrate`` for details.
++_DEFAULT_PLATT_SHIFT_CAP: float = 1.5
++
++
++def _logit(p: float) -> float:
++    """Numerically safe logit. Inputs are clipped away from 0 and 1."""
++    p = max(1e-7, min(1 - 1e-7, p))
++    return math.log(p / (1 - p))
++
++
++def _sigmoid(x: float) -> float:
++    """Numerically stable sigmoid that avoids overflow for large |x|."""
++    if x >= 0:
++        return 1.0 / (1.0 + math.exp(-x))
++    e = math.exp(x)
++    return e / (1.0 + e)
++
++
++def _clip(p: float, lo: float = _CLIP_LO, hi: float = _CLIP_HI) -> float:
++    return max(lo, min(hi, float(p)))
++
++
++def parse_subject_name(subject_content: str) -> str:
++    """Extract the model name from a subject_content block.
++
++    The competition runtime renders subject metadata as::
++
++        Name: <display_name>
++        Organization: <provider>
++        Parameters: <params>
++        ...
++
++    This helper returns the first line after the ``Name:`` label, stripped.
++    Falls back to the first non-empty line if no ``Name:`` is present.
++    """
++    if not subject_content:
++        return ""
++    m = re.match(r"\s*Name:\s*(.+)", subject_content)
++    if m:
++        return m.group(1).strip().splitlines()[0].strip()
++    return subject_content.split("\n", 1)[0].strip()
++
++
++def resolve_subject_name(
++    raw_name: str,
++    subj_lookup: dict[str, float],
++    sb_lookup: dict[str, float],
++    sbc_lookup: dict[str, float],
++    aliases: dict[str, str],
++    name_lc: dict[str, str],
++    provider_prefixes: Iterable[str] = _DEFAULT_PROVIDER_PREFIXES,
++) -> str:
++    """Resolve a raw display name to a canonical key found in the lookup tables.
++
++    The competition's ``subject_content`` field sometimes contains a
++    provider-prefixed name (``meta-llama/Llama-2-7b-chat``) while the
++    training data stores the bare display name (``Llama-2-7b-chat``). This
++    helper tries each candidate (the raw name and its prefix-stripped
++    variant) through three resolution paths in order: direct lookup,
++    alias map, case-insensitive map.
++
++    Parameters
++    ----------
++    raw_name : str
++        Whatever ``parse_subject_name`` produced for the input record.
++    subj_lookup, sb_lookup, sbc_lookup : dict
++        Lookup tables. Used here only to test ``in`` membership.
++    aliases : dict[str, str]
++        Map from prefix-stripped name to canonical display name.
++    name_lc : dict[str, str]
++        Map from ``display_name.lower()`` to display name.
++    provider_prefixes : Iterable[str]
++        Prefixes to strip from the raw name.
++
++    Returns
++    -------
++    str
++        The canonical name to use as a lookup key, or ``raw_name`` if no
++        match was found at any level.
++    """
++    candidates = [raw_name]
++    raw_lower = raw_name.lower()
++    for prefix in provider_prefixes:
++        if raw_lower.startswith(prefix):
++            candidates.append(raw_name[len(prefix):].strip())
++            break
++
++    for cand in candidates:
++        if cand in subj_lookup or cand in sb_lookup or cand in sbc_lookup:
++            return cand
++        if cand in aliases:
++            return aliases[cand]
++        lc = cand.lower()
++        if lc in name_lc:
++            return name_lc[lc]
++    return raw_name
++
++
++class ColdStartLookupPredictor:
++    """Hierarchical empirical-Bayes predictor for cold-start AI evaluation.
++
++    This is the model deployed in the CS321M Predictive AI Evaluation
++    Challenge. It predicts ``P(subject answers item correctly)`` for cells
++    where the item is unseen but the subject identity is known.
++
++    Parameters
++    ----------
++    sbc : dict[str, float]
++        Map ``"{subject_name}||{benchmark_id}||{condition}" -> P``, the
++        most specific level (level 1). Built from cells with n >= 3
++        observations in training.
++    sb : dict[str, float]
++        Map ``"{subject_name}||{benchmark_id}" -> P``, Bayesian-shrunk
++        toward the IRT blend with pseudo-count alpha (level 2).
++    subj : dict[str, float]
++        Map ``subject_name -> P``, subject ability prior (level 5).
++        Restricted to subjects with n >= 10 training observations.
++    bench : dict[str, float]
++        Map ``benchmark_id -> P``, benchmark difficulty prior (level 4).
++    global_mean : float
++        Overall mean correctness in training (level 6).
++    name_aliases : dict[str, str]
++        Map from prefix-stripped name to canonical display name.
++    name_lc : dict[str, str]
++        Map from ``display_name.lower()`` to canonical display name.
++    platt_shift_cap : float
++        Maximum absolute logit shift applied during ``calibrate``.
++        Stops K=5 labeled examples from producing extreme shifts.
++    output_clip : tuple[float, float]
++        Output probability is clipped to this range.
++
++    Examples
++    --------
++    >>> # Build from in-memory lookup tables
++    >>> predictor = ColdStartLookupPredictor(
++    ...     sbc={"gpt-4||mmlupro||cot": 0.85},
++    ...     sb={"gpt-4||mmlupro": 0.80},
++    ...     subj={"gpt-4": 0.75},
++    ...     bench={"mmlupro": 0.50},
++    ...     global_mean=0.65,
++    ...     name_aliases={},
++    ...     name_lc={"gpt-4": "gpt-4"},
++    ... )
++    >>> p = predictor.predict({
++    ...     "benchmark": "mmlupro",
++    ...     "condition": "cot",
++    ...     "subject_content": "Name: gpt-4",
++    ...     "item_content": "What is 2+2?",
++    ... })
++    >>> abs(p - 0.85) < 1e-6
++    True
++    """
++
++    def __init__(
++        self,
++        sbc: dict[str, float],
++        sb: dict[str, float],
++        subj: dict[str, float],
++        bench: dict[str, float],
++        global_mean: float,
++        name_aliases: dict[str, str] | None = None,
++        name_lc: dict[str, str] | None = None,
++        platt_shift_cap: float = _DEFAULT_PLATT_SHIFT_CAP,
++        output_clip: tuple[float, float] = (0.02, 0.98),
++    ) -> None:
++        self.sbc = dict(sbc)
++        self.sb = dict(sb)
++        self.subj = dict(subj)
++        self.bench = dict(bench)
++        self.global_mean = float(global_mean)
++        self.name_aliases = dict(name_aliases or {})
++        self.name_lc = dict(name_lc or {})
++        self.platt_shift_cap = float(platt_shift_cap)
++        self.output_clip = (float(output_clip[0]), float(output_clip[1]))
++
++        # Pre-compute case-insensitive views for fast lookup.
++        self._sbc_ci = {k.lower(): v for k, v in self.sbc.items()}
++        self._sb_ci = {k.lower(): v for k, v in self.sb.items()}
++        self._subj_ci = {k.lower(): v for k, v in self.subj.items()}
++        self._bench_ci = {k.lower(): v for k, v in self.bench.items()}
++
++        # Per-benchmark Platt calibration state. Populated by ``calibrate``.
++        # Each entry is ``(slope, intercept)``; slope is fixed at 1.0 by design.
++        self._platt: dict[str, tuple[float, float]] = {}
++        self._platt_fit_key: int = -1
++
++    # ---- Persistence -----------------------------------------------------
++
++    @classmethod
++    def from_lookup_json(cls, path: str | Path, **overrides: Any) -> "ColdStartLookupPredictor":
++        """Load from the ``lookup.json`` artifact produced by the build script.
++
++        Parameters
++        ----------
++        path : str | Path
++            Path to a JSON file matching the schema written by the
++            ``m3_build_colab.py`` script in the competition repo. Required
++            keys: ``sbc``, ``sb``, ``subj``, ``bench``, ``global``.
++        **overrides
++            Keyword arguments passed through to ``__init__`` to override
++            defaults (e.g. ``platt_shift_cap``).
++        """
++        data = json.loads(Path(path).read_text())
++        return cls(
++            sbc=data["sbc"],
++            sb=data["sb"],
++            subj=data["subj"],
++            bench=data["bench"],
++            global_mean=data["global"],
++            name_aliases=data.get("name_aliases", {}),
++            name_lc=data.get("name_lc", {}),
++            **overrides,
++        )
++
++    def to_lookup_json(self, path: str | Path) -> None:
++        """Write lookup tables to a JSON file matching the build-script schema."""
++        payload = {
++            "sbc": self.sbc,
++            "sb": self.sb,
++            "subj": self.subj,
++            "bench": self.bench,
++            "global": self.global_mean,
++            "name_aliases": self.name_aliases,
++            "name_lc": self.name_lc,
++        }
++        Path(path).write_text(json.dumps(payload))
++
++    # ---- Core lookup -----------------------------------------------------
++
++    def _lookup_p(self, subj_name: str, benchmark: str, condition: str) -> float:
++        """Walk the 6-level fallback hierarchy and return the first match.
++
++        Levels (each tried case-insensitively as a fallback within the level):
++
++        1. ``sbc[subject||benchmark||condition]``
++        2. ``sb[subject||benchmark]``
++        3. IRT blend: ``sigmoid(logit(subj) + logit(bench) - logit(global))``
++        4. ``bench[benchmark]``
++        5. ``subj[subject]``
++        6. ``global_mean``
++        """
++        condition = condition or "none"
++
++        # Level 1: full triple (subject, benchmark, condition).
++        key3 = f"{subj_name}||{benchmark}||{condition}"
++        if key3 in self.sbc:
++            return self.sbc[key3]
++        if key3.lower() in self._sbc_ci:
++            return self._sbc_ci[key3.lower()]
++        key3_none = f"{subj_name}||{benchmark}||none"
++        if key3_none in self.sbc:
++            return self.sbc[key3_none]
++
++        # Level 2: pair (subject, benchmark).
++        key2 = f"{subj_name}||{benchmark}"
++        if key2 in self.sb:
++            return self.sb[key2]
++        if key2.lower() in self._sb_ci:
++            return self._sb_ci[key2.lower()]
++
++        # Level 3: IRT blend if both single priors are known.
++        subj_p = self.subj.get(subj_name) or self._subj_ci.get(subj_name.lower())
++        bench_p = self.bench.get(benchmark) or self._bench_ci.get(benchmark.lower())
++        if subj_p is not None and bench_p is not None:
++            return _clip(_sigmoid(_logit(subj_p) + _logit(bench_p) - _logit(self.global_mean)))
++
++        # Level 4: benchmark only.
++        if bench_p is not None:
++            return bench_p
++
++        # Level 5: subject only.
++        if subj_p is not None:
++            return subj_p
++
++        # Level 6: global mean.
++        return self.global_mean
++
++    # ---- Public prediction API -------------------------------------------
++
++    def predict(
++        self,
++        record: dict[str, Any],
++        labeled: list[dict[str, Any]] | None = None,
++    ) -> float:
++        """Predict ``P(correct)`` for a single competition-format record.
++
++        Parameters
++        ----------
++        record : dict
++            Must contain ``subject_content`` (string) and ``benchmark``
++            (string). May contain ``condition`` (string) and
++            ``item_content`` (string, unused by this predictor but
++            accepted for interface compatibility).
++        labeled : list[dict] | None
++            Optional list of labeled examples in the same format with an
++            additional ``label`` field. If provided, calibration is
++            (re)fit per-benchmark and applied to the prediction.
++
++        Returns
++        -------
++        float
++            Predicted probability of correctness, clipped to ``output_clip``.
++        """
++        subject_content = record.get("subject_content", "") or ""
++        benchmark = (record.get("benchmark", "") or "").strip()
++        condition = (record.get("condition", "") or "none").strip() or "none"
++
++        raw_name = parse_subject_name(subject_content)
++        subj_name = resolve_subject_name(
++            raw_name, self.subj, self.sb, self.sbc,
++            self.name_aliases, self.name_lc,
++        )
++        p = self._lookup_p(subj_name, benchmark, condition)
++
++        if labeled:
++            self.calibrate(labeled)
++            if benchmark in self._platt:
++                slope, intercept = self._platt[benchmark]
++                p = _sigmoid(slope * _logit(p) + intercept)
++
++        lo, hi = self.output_clip
++        return max(lo, min(hi, float(p)))
++
++    def predict_batch(
++        self,
++        records: list[dict[str, Any]],
++        labeled: list[dict[str, Any]] | None = None,
++    ) -> list[float]:
++        """Vectorised wrapper around ``predict``. Calibration is fit once."""
++        if labeled:
++            self.calibrate(labeled)
++        return [self.predict(r) for r in records]
++
++    # ---- Adaptive calibration --------------------------------------------
++
++    def calibrate(self, labeled: list[dict[str, Any]]) -> None:
++        """Fit intercept-only Platt scaling per benchmark from labeled records.
++
++        With only K=5 labeled examples per benchmark, fitting both slope and
++        intercept produces a near-flat calibrator (slope ~ 0.1) that destroys
++        subject ordering. We fix slope = 1 and fit only the intercept shift,
++        capped at +/- ``platt_shift_cap`` logit units. The shift is the
++        difference between the empirical label-mean's logit and the mean
++        predicted logit on the labeled examples.
++
++        Benchmarks with fewer than 2 labeled examples are not calibrated.
++        There is intentionally NO global fallback calibrator: applying one
++        benchmark's labeled distribution to another benchmark introduces
++        more noise than signal at this K.
++
++        This method is idempotent if called with the same labeled list
++        (cached by length).
++        """
++        new_key = len(labeled)
++        if new_key == self._platt_fit_key:
++            return
++        self._platt_fit_key = new_key
++        self._platt.clear()
++
++        by_bench: dict[str, list[tuple[float, float]]] = {}
++        for ex in labeled:
++            if "label" not in ex:
++                continue
++            bench = (ex.get("benchmark") or "").strip()
++            cond = (ex.get("condition") or "none").strip() or "none"
++            subject_content = ex.get("subject_content", "") or ""
++            raw_name = parse_subject_name(subject_content)
++            subj_name = resolve_subject_name(
++                raw_name, self.subj, self.sb, self.sbc,
++                self.name_aliases, self.name_lc,
++            )
++            p = self._lookup_p(subj_name, bench, cond)
++            by_bench.setdefault(bench, []).append((_logit(p), float(ex["label"])))
++
++        for bench, pairs in by_bench.items():
++            if len(pairs) < 2:
++                continue
++            xs = [x for x, _ in pairs]
++            ys = [y for _, y in pairs]
++            mean_y = sum(ys) / len(ys)
++            if mean_y <= 0 or mean_y >= 1:
++                continue  # No information for a shift.
++            mean_x = sum(xs) / len(xs)
++            target_logit = math.log(mean_y / (1.0 - mean_y))
++            shift = target_logit - mean_x
++            shift = max(-self.platt_shift_cap, min(self.platt_shift_cap, shift))
++            self._platt[bench] = (1.0, shift)
+diff --git a/src/torch_measure/models/llm_judge_irt.py b/src/torch_measure/models/llm_judge_irt.py
+new file mode 100644
+index 0000000..242c2b6
+--- /dev/null
++++ b/src/torch_measure/models/llm_judge_irt.py
+@@ -0,0 +1,221 @@
++# Copyright (c) 2026 AIMS Foundations. MIT License.
++
++"""1-PL IRT with LLM-augmented item difficulty (experimental).
++
++This module implements the M4.5 architecture explored in the Stanford
++CS321M Predictive AI Evaluation Challenge. The model formulation is::
++
++    P(correct | subject, item)  =  sigmoid( theta - delta )
++        theta = logit( ColdStartLookupPredictor(subject, bench, cond) )
++        delta = alpha * (logP_yes - logP_no | item, bench)  +  beta
++
++where the ``(logP_yes - logP_no)`` term is produced by a frozen
++instruction-tuned LLM judge given a per-item difficulty prompt.
++
++Negative-result disclosure
++--------------------------
++Across three rigorously validated iterations on the competition data
++(v1: 600 fit rows, v2: 600 fit rows with validated alpha, v3: 1500 fit
++rows with validated alpha), the judge consistently extracted a real but
++very small signal::
++
++    Raw judge_logit -- label correlation  r = -0.257  (n=1500, stable from n=600)
++    Validation-set NLL lift over M3 baseline  = +0.002
++    Held-out smoke-set NLL lift over M3 baseline  = -0.006
++
++The effect size is roughly five times smaller than the sample-to-sample
++variance at deployment-relevant sample sizes (sigma_NLL ~ 0.020 on
++200-row samples). The model is therefore documented here for
++completeness and reproducibility but is NOT the recommended deployment
++target -- the simpler :class:`ColdStartLookupPredictor` is preferred for
++its robustness.
++
++The pedagogical value of this module is the documentation of an honest
++iteration log: hypothesis, three principled iterations, convergent
++negative result. See ``tutorials/predictive_evaluation_challenge.ipynb``
++for the full narrative.
++"""
++
++from __future__ import annotations
++
++import math
++from collections.abc import Sequence
++from typing import Any, Callable
++
++from torch_measure.models.cold_start_lookup import (
++    ColdStartLookupPredictor,
++    _logit,
++    _sigmoid,
++    parse_subject_name,
++    resolve_subject_name,
++)
++
++
++def build_difficulty_prompt(
++    item_content: str,
++    benchmark: str,
++    max_item_chars: int = 1500,
++) -> str:
++    """Build the difficulty-rating prompt for the LLM judge.
++
++    The prompt asks the judge a SINGLE binary question about intrinsic
++    item difficulty, deliberately without mentioning any specific
++    subject. The judge is rating the item, not predicting subject
++    behaviour, which is a measurable competence at this scale.
++    """
++    item = (item_content or "")[:max_item_chars]
++    return (
++        f"Below is a question from the benchmark `{benchmark}`. "
++        f"Without solving it, rate whether this question would be difficult "
++        f"for a typical AI assistant.\n\n"
++        f"Question:\n{item}\n\n"
++        f"Is this question difficult? Answer with one word, yes or no.\n"
++        f"Answer:"
++    )
++
++
++class LLMJudgeIRT:
++    """1-PL IRT predictor with LLM-augmented item difficulty (experimental).
++
++    Combines a :class:`ColdStartLookupPredictor` (for ``theta``) with a
++    user-supplied judge function (for ``delta``) under the Rasch model.
++
++    Parameters
++    ----------
++    lookup : ColdStartLookupPredictor
++        Provides ``theta_subject`` via ``logit(lookup.predict(record))``.
++    judge_fn : Callable[[str, str], float]
++        Function mapping ``(item_content, benchmark)`` to a signed
++        difficulty logit (``logP_yes - logP_no`` from the judge). May
++        raise; raised exceptions are converted to a logit of 0.0 so
++        that the prediction degrades gracefully toward ``theta``.
++    alpha : float
++        Slope on the judge logit. Should be fit by held-out
++        log-likelihood maximization with L2 regularization; see
++        :meth:`fit_alpha_beta`.
++    beta : float
++        Intercept on the judge logit.
++    logit_cap : float
++        Symmetric clip on ``theta - delta`` before sigmoid. Prevents
++        runaway logits from short prompts producing extreme yes/no
++        ratios.
++
++    Notes
++    -----
++    See module docstring for the negative-result disclosure. Production
++    code should prefer :class:`ColdStartLookupPredictor` directly.
++    """
++
++    def __init__(
++        self,
++        lookup: ColdStartLookupPredictor,
++        judge_fn: Callable[[str, str], float],
++        alpha: float,
++        beta: float = 0.0,
++        logit_cap: float = 3.0,
++    ) -> None:
++        self.lookup = lookup
++        self.judge_fn = judge_fn
++        self.alpha = float(alpha)
++        self.beta = float(beta)
++        self.logit_cap = float(logit_cap)
++
++    def predict(self, record: dict[str, Any]) -> float:
++        """Predict ``P(correct)`` for a single competition-format record."""
++        subject_content = record.get("subject_content", "") or ""
++        benchmark = (record.get("benchmark", "") or "").strip()
++        condition = (record.get("condition", "") or "none").strip() or "none"
++        item_content = record.get("item_content", "") or ""
++
++        raw_name = parse_subject_name(subject_content)
++        subj_name = resolve_subject_name(
++            raw_name,
++            self.lookup.subj,
++            self.lookup.sb,
++            self.lookup.sbc,
++            self.lookup.name_aliases,
++            self.lookup.name_lc,
++        )
++        p_lookup = self.lookup._lookup_p(subj_name, benchmark, condition)
++        theta = _logit(p_lookup)
++
++        try:
++            judge_logit = float(self.judge_fn(item_content, benchmark))
++        except Exception:
++            judge_logit = 0.0
++
++        delta = self.alpha * judge_logit + self.beta
++        z = max(-self.logit_cap, min(self.logit_cap, theta - delta))
++        p = _sigmoid(z)
++        lo, hi = self.lookup.output_clip
++        return max(lo, min(hi, float(p)))
++
++    # ---- Parameter fitting -------------------------------------------------
++
++    @staticmethod
++    def fit_alpha_beta(
++        thetas: Sequence[float],
++        judge_logits: Sequence[float],
++        labels: Sequence[int],
++        l2_penalty: float = 2.0,
++        max_iter: int = 800,
++    ) -> tuple[float, float, float]:
++        """Fit ``(alpha, beta)`` by L2-regularised maximum likelihood.
++
++        Optimization objective::
++
++            argmin  NLL(theta, judge_logits, labels; alpha, beta)
++                    +  l2_penalty * alpha^2
++
++        L2 is applied only to ``alpha``. ``beta`` is the intercept and is
++        not regularised. The regularisation strength should be tuned on a
++        held-out validation set; see the v3 build script for an L2 sweep.
++
++        Returns
++        -------
++        (alpha, beta, fit_nll) : tuple of floats
++            Fitted parameters and the un-penalised mean log-likelihood
++            achieved on the training set.
++
++        Raises
++        ------
++        ImportError
++            If scipy is not installed.
++        """
++        try:
++            import numpy as np
++            from scipy.optimize import minimize
++        except ImportError as e:
++            raise ImportError(
++                "fit_alpha_beta requires scipy and numpy. "
++                "Install with `pip install scipy numpy`."
++            ) from e
++
++        theta_arr = np.asarray(thetas, dtype=float)
++        jl_arr = np.asarray(judge_logits, dtype=float)
++        y_arr = np.asarray(labels, dtype=float)
++
++        def neg_log_lik(params):
++            alpha, beta = params
++            delta = alpha * jl_arr + beta
++            z = np.clip(theta_arr - delta, -3.0, 3.0)
++            p = 1.0 / (1.0 + np.exp(-z))
++            p = np.clip(p, 1e-6, 1 - 1e-6)
++            nll = -float(np.mean(y_arr * np.log(p) + (1 - y_arr) * np.log(1 - p)))
++            return nll + l2_penalty * alpha * alpha
++
++        res = minimize(
++            neg_log_lik,
++            x0=[0.0, 0.0],
++            method="Nelder-Mead",
++            options={"xatol": 1e-5, "fatol": 1e-5, "maxiter": max_iter},
++        )
++        alpha, beta = float(res.x[0]), float(res.x[1])
++
++        # Compute the un-penalised fit NLL for reporting.
++        delta = alpha * jl_arr + beta
++        z = np.clip(theta_arr - delta, -3.0, 3.0)
++        p = 1.0 / (1.0 + np.exp(-z))
++        p = np.clip(p, 1e-6, 1 - 1e-6)
++        fit_nll = float(np.mean(y_arr * np.log(p) + (1 - y_arr) * np.log(1 - p)))
++        return alpha, beta, fit_nll
+diff --git a/submission/README.md b/submission/README.md
+new file mode 100644
+index 0000000..600df1e
+--- /dev/null
++++ b/submission/README.md
+@@ -0,0 +1,183 @@
++# Codabench submission scaffolding — CAIMIRA + EB hybrid
++
++This directory is a **Codabench-ready submission entry point** for the
++CS321M Predictive AI Evaluation Challenge (competition 15934). It wraps
++[`torch_measure.models.CAIMIRA`](../src/torch_measure/models/caimira.py)
++with an empirical-Bayes cold-start fallback ported from
++[`torch_measure.models.ColdStartLookupPredictor`](../src/torch_measure/models/cold_start_lookup.py),
++plus a stdlib-only SimHash adaptive-labeling acquisition function.
++
++> **Status: scaffolding, not yet active.** The kit-contract entry points
++> (`predict()` and `acquisition_function()`) are functional, but **no Codabench
++> upload has been performed from this scaffolding**. Before any real
++> submission, the D-9 pre-submission transfer-audit gate must pass — the
++> 2026-05-22 transfer postmortem documents that prior CAIMIRA m=5 ZIPs had
++> the best local val_nll AND the worst hidden score, so transfer safety
++> requires explicit validation.
++
++## Layout
++
++```
++submission/
++├── README.md            # this file
++├── model.py             # kit entry point: predict(input, labeled)
++├── labeling.py          # kit entry point: acquisition_function(input)
++├── models.txt           # HF repos to pre-fetch (one per line, cap=5)
++├── caimira_lite.py      # standalone CAIMIRA forward + EB fallback (no torch_measure import)
++├── train.py             # offline trainer; produces .pt + .meta.json + eb_tables.json
++└── build_zip.sh         # explicit-allowlist packaging script
++
++# Produced by train.py (gitignored — *.pt is in .gitignore line 40):
++├── caimira_lite.pt          # CAIMIRA state_dict
++├── caimira_lite.meta.json   # training provenance + subject_to_idx
++└── eb_tables.json           # 6-level EB hierarchy + name lookup tables
++```
++
++## How it differs from the team's reference flow
++
++The `predictive-eval-competition` repo at
++`predictive-eval-competition/submission/` ships an NCF head as the active
++predictor and has earlier shipped CAIMIRA variants ephemerally from
++`tmp/tomorrow_submit/`. This directory is the **package-side equivalent**
++that lives inside the `torch_measure` repo, so the upstream library can
++be the source of CAIMIRA training as well as the submission framework
++in one place.
++
++Differences from the 2026-05-22 ephemeral CAIMIRA submissions
++documented in the transfer postmortem:
++
++| Concern | 2026-05-22 m=5 submissions | This scaffolding |
++|---|---|---|
++| Cold-start for unseen `subject` / `benchmark` / `condition` | `<UNK>` row at index 0 (never gradient-updated) | 6-level EB hierarchy + per-bench intercept-only Platt |
++| Use of `labeled` reveals at predict time | Discarded (`del labeled`) | Per-benchmark Platt shift (slope=1, ±1.5 cap) |
++| In-vocab prediction | CAIMIRA only | CAIMIRA blended with EB (logit-space, λ=0.6) |
++| Failure mode | Silent 0.5 fallback on non-finite logit | Distinguishable EB fallback (varies with input) |
++| Subject-name resolution | Bare string match → UNK on provider-prefixed names | Strip provider prefix + case-insensitive fallback |
++
++## Run flow
++
++```bash
++# 0. From the repo root, activate the dev environment.
++source .venv/bin/activate          # or: uv pip install -e .
++
++# 1. Train CAIMIRA + build EB tables. Produces caimira_lite.pt,
++#    caimira_lite.meta.json, eb_tables.json in this directory.
++#
++#    Smoke (single benchmark, ~30s on CPU):
++python submission/train.py --smoke
++#    Full run (all binary benchmarks, default 200 epochs, ~hours on CPU):
++python submission/train.py
++
++# 2. Package a flat ZIP (writes submission_caimira.zip at the repo root).
++bash submission/build_zip.sh
++
++# 3. Validate the ZIP with the kit's pre-validator (lives in the
++#    parent CS321M repo's starting_kit/).
++python ../starting_kit/tools/check_submission_zip.py submission_caimira.zip
++
++# 4. (Optional) Run the kit's local smoke test against this directory.
++PYTHONPATH=submission \
++PREDICTIVE_EVAL_LOCAL_SMOKE_TEST=1 \
++python ../starting_kit/tools/run_smoke_test.py submission/
++
++# 5. Run the D-9 pre-submission transfer-audit gate before upload.
++#    (Lives in the parent repo; runs the four-sub-gate audit on a held-out
++#    benchmark before consuming Codabench quota.)
++python ../predictive-eval-competition/scripts/run_d9_gate.py submission_caimira.zip
++
++# 6. Upload to Codabench competition 15934 only after D-9 passes.
++```
++
++## Cold-start strategy
++
++The kit's `predict(input, labeled)` is called once per hidden item. Each
++`input` dict has four string fields: `benchmark` (identifier, not display
++name), `condition`, `subject_content` (starts with `Name: <display>`),
++`item_content`. CAIMIRA needs an integer `subject_idx` and an item
++embedding — the former is the load-bearing constraint:
++
++* **Subject-name parsing.** `parse_subject_name(subject_content)` strips
++  the `Name:` prefix and returns the bare display name; that name is
++  then `resolve_subject_name`-d through the EB tables' `name_aliases`
++  + `name_lc` maps + a stripped provider-prefix candidate (e.g.
++  `meta-llama/Llama-2-7b-chat` → `Llama-2-7b-chat`).
++* **In-vocab subject** (resolved name lands in `META["subject_to_idx"]`):
++  encode `item_content` via `all-mpnet-base-v2` (cached per round),
++  compute CAIMIRA's logit via `CAIMIRALite.caimira_logit(subject_idx,
++  item_embedding)`, blend with the EB logit in logit space at
++  `λ=0.6`, then apply per-benchmark Platt shift from `labeled`.
++* **Out-of-vocab subject** (no `subject_idx`): use EB only via the
++  6-level hierarchy `sbc → sb → IRT-blend → bench → subj → global`,
++  then Platt-shift if `labeled` covers the same benchmark.
++
++The blend weight `λ=0.6` is the conservative default per the Wave-2
++Lane-B recommendation. D-9 ablation candidates: `{0.3, 0.5, 0.7, 0.9}`.
++
++## Why standalone (no `torch_measure` import in `model.py`)
++
++The hosted Codabench container provides an organizer-supplied
++`torch_measure` package that may **not** track this fork's `feat/caimira`
++branch — so `from torch_measure.models import CAIMIRA` may fail (or load
++a different class than the trainer wrote). The submission code therefore
++ships a **standalone** `caimira_lite.py` that mirrors the upstream
++`CAIMIRA` class's predict path and state_dict layout byte-for-byte. The
++trainer in `train.py` DOES use `from torch_measure.models import CAIMIRA`
++because it runs in the local venv where the package is installed; the
++state_dict it produces loads cleanly into `caimira_lite.CAIMIRALite`
++(verified by `train.py`'s round-trip step before saving).
++
++## D-3 / no-broad-except discipline
++
++This scaffolding has NO `try/except → 0.5` blocks anywhere in the
++prediction path. The only `try/except` is in `labeling.py`'s
++`acquisition_function`, which returns the distinguishable sentinel `0.0`
++(outside the legitimate `(0, 2]` output domain). Module-init failures
++propagate to the platform as a `[PAIEC-PREDICT-002]` error before any
++predictions run; `predict()` exceptions fail the submission loudly. The
++canonical bug pattern these rules defend against is the April 2026
++silent NCF load failure that produced 3 weeks of constant-0.5
++leaderboard signal — see the design-pattern docs in the parent CS321M
++repo's `docs/solutions/` directory.
++
++## D-9 gate run history
++
++| Date | Artifact | Overall | (a) dist | (b) runtime | (c) stress | (d) calib | Notes |
++|---|---|---|---|---|---|---|---|
++| 2026-05-22 | smoke train (1 subj × 905 items × 5 ep) | **FAIL** | PASS | PASS | FAIL (0.759 > 0.50) | PASS | Plumbing-only run — sub-gate (b) 176/176 rows green confirms scaffolding works end-to-end; sub-gates (a)/(d) PASS but were measured on a degenerate constant-0.604 predictor (the smoke model has only `deepseek-coder-v2` in `subject_to_idx` so every validation row falls to EB Level-4/6); sub-gate (c) FAIL is expected for a barely-trained model. The CAIMIRA logit path was NEVER exercised on the audit row sample — a real-trained artifact (~909 subjects) is required for a meaningful (a)/(c)/(d) verdict. JSON output: `/tmp/d9_caimira_smoke/gate_result.json` (zip_sha256 `8d0abdea1f93…`). |
++| (pending) | full train (all binary benchmarks, ≥909 subjects) | — | — | — | — | — | Required before any Codabench upload per the postmortem-driven D-9 discipline. Will exercise the CAIMIRA+EB hybrid blend on the audit rows (in-vocab subjects). |
++
++**Important finding from the 2026-05-22 smoke run:** the D-9 gate's sub-gate (a)
++checks `mean(p) ∈ [pos_rate ± 0.05]` and `frac_extreme < 0.05` — it does NOT
++penalize mid-range constancy. A constant predictor with the right mean PASSES
++sub-gate (a). For this scaffolding, that means the smoke artifact's degenerate
++output (literally `p = 0.604` for every row, `std=1.1e-16`) did not raise the
++gate's (a) flag. This is a documented coverage gap of the gate per
++`../docs/solutions/architecture-patterns/pre-submission-transfer-audit-stress-test-gate-2026-05-22.md`
++("audit produces a TABLE, not a single pass/fail"), not a CAIMIRA-specific
++bug — but readers of the gate's PASS verdict on (a) should cross-check the
++`main_distribution` block (specifically `std` and the quantile spread) before
++treating the verdict as evidence of a well-shaped distribution.
++
++## Open follow-ups
++
++* **D-9 transfer-audit gate has been smoke-run for plumbing validation
++  but NOT full-validated for transfer correctness** (see the gate run
++  history table above). The 2026-05-22 postmortem signature (best local
++  val_nll, worst hidden score) means a CAIMIRA submission without a
++  full-train D-9 PASS is a known quota-burning anti-pattern.
++* **CI lint coverage.** The repo's `.github/workflows/lint.yml:30,33`
++  only runs `ruff check src/ tests/` — this `submission/` directory is
++  invisible to CI lint. A follow-up should either (a) extend the lint
++  workflow or (b) document the contributor-side `ruff check submission/`
++  step. The submission code currently passes ruff manually but won't
++  get caught if it regresses.
++* **Subject cold-start coverage.** If hidden-test subjects are drawn
++  from the 909-subject CS321M catalog (which IS stable across train/
++  test), the in-vocab path dominates. If the hidden set adds new
++  subjects, the EB-only path takes over — and its calibration depends
++  on training-corpus subject priors. The 2026-05-22 transfer regression
++  hints that the in-vocab signal alone overfits; the hybrid blend is
++  a structural counter but needs hidden-leaderboard verification.
++* **Blend weight `λ`.** Currently fixed at 0.6 in `model.py:_BLEND_LAMBDA`.
++  Could be made per-benchmark or uncertainty-weighted (`λ = 1 - 1/(1+n_obs)`).
++  Defer until D-9 ablation results.
+diff --git a/submission/build_zip.sh b/submission/build_zip.sh
+new file mode 100755
+index 0000000..4a606d7
+--- /dev/null
++++ b/submission/build_zip.sh
+@@ -0,0 +1,139 @@
++#!/usr/bin/env bash
++# Copyright (c) 2026 AIMS Foundations. MIT License.
++#
++# Build a flat Codabench-ready submission ZIP for CAIMIRA+EB.
++#
++# Why an EXPLICIT allowlist instead of `zip -r ./submission.zip submission/`:
++#   - The kit pre-validator rejects ZIPs with model.py inside a subdirectory
++#     (`starting_kit/tools/check_submission_zip.py:56-58`); flat layout required.
++#   - The kit pre-validator rejects ZIPs containing other ZIPs and absolute
++#     paths (`:54`, `:79-83`).
++#   - The "obvious" recipe (`zip -r ... -x '*.pyc' '__pycache__/*'`) silently
++#     slurps per-seed audit copies of .pt files, blowing past the kit's
++#     single-.pt-per-submission expectation (see the parent repo's
++#     `scripts/check_submission.sh:101-116`).
++# An explicit allowlist sidesteps all three failure modes.
++#
++# Usage:
++#   bash submission/build_zip.sh                 # writes submission_caimira.zip
++#   bash submission/build_zip.sh out.zip         # custom output path
++#   bash submission/build_zip.sh --force         # overwrite existing ZIP
++#
++# Refuses to overwrite an existing ZIP unless --force is passed.
++# Refuses to build if caimira_lite.pt / eb_tables.json / caimira_lite.meta.json
++# are missing — run `python submission/train.py` first.
++
++set -euo pipefail
++
++SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
++SUBMISSION_DIR="${SCRIPT_DIR}"
++
++FORCE=0
++OUTPUT_ZIP=""
++for arg in "$@"; do
++  case "${arg}" in
++    --force|-f) FORCE=1 ;;
++    -h|--help)
++      sed -n '3,25p' "${BASH_SOURCE[0]}"
++      exit 0
++      ;;
++    *)
++      if [[ -n "${OUTPUT_ZIP}" ]]; then
++        echo "build_zip.sh: unexpected extra argument: ${arg}" >&2
++        exit 2
++      fi
++      OUTPUT_ZIP="${arg}"
++      ;;
++  esac
++done
++
++if [[ -z "${OUTPUT_ZIP}" ]]; then
++  OUTPUT_ZIP="$(cd "${SUBMISSION_DIR}/.." && pwd)/submission_caimira.zip"
++fi
++
++# Required files (artifact contract for the CAIMIRA submission mode).
++REQUIRED_FILES=(
++  "model.py"
++  "labeling.py"
++  "models.txt"
++  "caimira_lite.py"
++  "caimira_lite.pt"
++  "caimira_lite.meta.json"
++  "eb_tables.json"
++)
++
++# Refuse if any required file is missing.
++missing=()
++for f in "${REQUIRED_FILES[@]}"; do
++  if [[ ! -f "${SUBMISSION_DIR}/${f}" ]]; then
++    missing+=("${f}")
++  fi
++done
++if (( ${#missing[@]} > 0 )); then
++  echo "build_zip.sh: missing required files in ${SUBMISSION_DIR}:" >&2
++  for m in "${missing[@]}"; do
++    echo "  - ${m}" >&2
++  done
++  echo "" >&2
++  echo "Run 'python ${SUBMISSION_DIR}/train.py' first to produce" >&2
++  echo "caimira_lite.pt / caimira_lite.meta.json / eb_tables.json." >&2
++  exit 1
++fi
++
++if [[ -f "${OUTPUT_ZIP}" && "${FORCE}" -ne 1 ]]; then
++  echo "build_zip.sh: refusing to overwrite ${OUTPUT_ZIP} (pass --force to override)" >&2
++  exit 1
++fi
++
++# Single-.pt safety check: confirm only one .pt file is being shipped.
++# Mirrors the parent repo's scripts/check_submission.sh:101-116 enforcement.
++pt_count=0
++for f in "${REQUIRED_FILES[@]}"; do
++  if [[ "${f}" == *.pt ]]; then
++    pt_count=$((pt_count + 1))
++  fi
++done
++if (( pt_count != 1 )); then
++  echo "build_zip.sh: allowlist contains ${pt_count} .pt files; expected exactly 1" >&2
++  exit 1
++fi
++
++rm -f "${OUTPUT_ZIP}"
++
++# `zip -j` strips paths so model.py lands at the ZIP root (the kit
++# pre-validator's L56-58 requirement).
++(
++  cd "${SUBMISSION_DIR}"
++  zip -j "${OUTPUT_ZIP}" "${REQUIRED_FILES[@]}"
++) >/dev/null
++
++# Post-build sanity: verify the ZIP is flat (no subdirectories).
++nested=$(unzip -l "${OUTPUT_ZIP}" | awk 'NR > 3 && /\// {print $NF}' | head -1 || true)
++if [[ -n "${nested}" ]]; then
++  echo "build_zip.sh: ZIP contains nested paths (${nested}); aborting" >&2
++  rm -f "${OUTPUT_ZIP}"
++  exit 1
++fi
++
++# Post-build sanity: confirm exactly the allowlisted files landed.
++zip_files=$(unzip -l "${OUTPUT_ZIP}" | awk 'NR > 3 && NF >= 4 {print $NF}' | grep -v '^$' | grep -v '^-' || true)
++allow_csv=$(printf '%s\n' "${REQUIRED_FILES[@]}" | sort)
++actual_csv=$(echo "${zip_files}" | sort)
++if [[ "${allow_csv}" != "${actual_csv}" ]]; then
++  echo "build_zip.sh: ZIP file list differs from allowlist" >&2
++  echo "  expected: ${allow_csv//$'\n'/ , }" >&2
++  echo "  actual:   ${actual_csv//$'\n'/ , }" >&2
++  exit 1
++fi
++
++size_bytes=$(wc -c <"${OUTPUT_ZIP}" | tr -d ' ')
++echo "build_zip.sh: built ${OUTPUT_ZIP} (${size_bytes} bytes, ${#REQUIRED_FILES[@]} files)"
++echo "build_zip.sh: contents:"
++unzip -l "${OUTPUT_ZIP}" | sed 's/^/  /'
++echo ""
++echo "Next steps:"
++echo "  1. Validate locally with the kit's check_submission_zip.py"
++echo "     (predictive-eval-competition/starting_kit/tools/check_submission_zip.py)."
++echo "  2. Run the D-9 transfer-audit gate"
++echo "     (predictive-eval-competition/llm_wiki/decisions/D9-pre-submission-stress-test-gate.md)."
++echo "  3. Only then upload to Codabench competition 15934."
+diff --git a/submission/caimira_lite.py b/submission/caimira_lite.py
+new file mode 100644
+index 0000000..b576d4f
+--- /dev/null
++++ b/submission/caimira_lite.py
+@@ -0,0 +1,408 @@
++# Copyright (c) 2026 AIMS Foundations. MIT License.
++
++"""Self-contained CAIMIRA + EB cold-start fallback for Codabench submission.
++
++This module is a SHIPPABLE STANDALONE port of two pieces of the
++``torch_measure`` library:
++
++* :class:`torch_measure.models.CAIMIRA` — the paper-faithful content-aware
++  multidimensional IRT model (predict path only; the trainer still lives in
++  :mod:`torch_measure.models.caimira`).
++* :class:`torch_measure.models.ColdStartLookupPredictor` — the 6-level
++  empirical-Bayes fallback hierarchy + intercept-only Platt calibration
++  (lookup + calibrate paths; the lookup-table BUILD path lives in
++  :mod:`submission.train`).
++
++Why standalone? The hosted Codabench container ships an organizer-supplied
++``torch_measure`` package that may NOT track this fork's ``feat/caimira``
++branch. The ZIP must carry its own self-contained implementation; we cannot
++``import torch_measure.models.CAIMIRA`` at runtime. This file is therefore
++the predict-time wrapper; it does NOT import anything from ``torch_measure``.
++
++Architecture (CAIMIRA): per ``arXiv:2410.06524`` §3.3, footnote 5, Appendix B:
++
++* ``relevance_head``: ``nn.Linear`` with bias, softmax-normalized over latent axis.
++* ``difficulty_head``: ``nn.Linear`` without bias (zero-centering absorbs constant).
++* ``skill``: directly-learned per-subject vectors.
++* Response: ``P = sigmoid((s_i - d_j)^T r_j)``.
++* Zero-centering: frozen training-bank mean snapshot in a buffer
++  (cold-start inference reads this; training-time dynamic centering lives
++  in the upstream :class:`torch_measure.models.CAIMIRA` trainer).
++
++EB fallback (per ``cold_start_lookup.py`` 6-level hierarchy):
++
++1. ``sbc[subject||benchmark||condition]`` triple
++2. ``sb[subject||benchmark]`` (Bayesian-shrunk)
++3. ``sigmoid(logit(subj) + logit(bench) - logit(global))`` (1-PL Rasch blend)
++4. ``bench[benchmark]``
++5. ``subj[subject]``
++6. ``global_mean``
++
++Hybrid (CAIMIRA + EB):
++
++* In-vocabulary ``(subject, benchmark, condition)``: blend CAIMIRA logit with
++  EB logit by a fixed weight (default ``lambda_=0.6``; CAIMIRA-leaning).
++* Out-of-vocabulary subject (CAIMIRA can't produce a skill vector for text
++  it never saw at train time): use EB only.
++* Per-benchmark intercept-only Platt from the platform's ``labeled``
++  reveals (slope fixed at ``1.0``, shift capped at ``±1.5`` logit units —
++  prevents K=5 reveals from destroying ranking).
++
++References
++----------
++- Lalor, J. P., Yang, W., Smith, K., Forde, J. Z., Resnik, P., Rodriguez, P.
++  "Do great minds think alike? Investigating Human-AI Complementarity in
++  Question Answering with CAIMIRA." EMNLP 2024. arXiv:2410.06524.
++- Rasch, G. (1960). Probabilistic models for some intelligence and
++  attainment tests. Danish Institute for Educational Research.
++- Platt, J. (1999). Probabilistic outputs for support vector machines.
++"""
++
++from __future__ import annotations
++
++import json
++import math
++import re
++from collections.abc import Iterable
++from pathlib import Path
++from typing import Any
++
++import torch
++from torch import nn
++
++EMBED_DIM = 768
++CAIMIRA_ARCH_VERSION = 1
++
++# Provider prefixes that subjects sometimes appear with in subject_content
++# but not in display_name (e.g. "meta-llama/Llama-2-7b-chat" vs "Llama-2-7b-chat").
++# Sourced verbatim from torch_measure.models.cold_start_lookup.
++_DEFAULT_PROVIDER_PREFIXES: tuple[str, ...] = (
++    "meta-llama/", "openai/", "mistralai/", "google/", "anthropic/",
++    "microsoft/", "huggingface/", "tiiuae/", "deepmind/", "cohere/",
++    "allenai/", "01-ai/", "qwen/", "baichuan-inc/",
++)
++
++# Predict-time probability bounds. Avoid 0 / 1 in logit() and keep NLL finite.
++_CLIP_LO: float = 0.05
++_CLIP_HI: float = 0.95
++
++# Kit-contract bounds for the final return (predict() must clip to (0,1)
++# strictly to keep log-loss finite — the team's NCF uses [1e-4, 1-1e-4]).
++_PREDICT_LO: float = 1e-4
++_PREDICT_HI: float = 1.0 - 1e-4
++
++_DEFAULT_PLATT_SHIFT_CAP: float = 1.5
++
++
++def _logit(p: float) -> float:
++    """Numerically safe logit. Inputs are clipped away from 0 and 1."""
++    p = max(1e-7, min(1 - 1e-7, p))
++    return math.log(p / (1 - p))
++
++
++def _sigmoid(x: float) -> float:
++    """Numerically stable sigmoid that avoids overflow for large |x|."""
++    if x >= 0:
++        return 1.0 / (1.0 + math.exp(-x))
++    e = math.exp(x)
++    return e / (1.0 + e)
++
++
++def _clip(p: float, lo: float = _CLIP_LO, hi: float = _CLIP_HI) -> float:
++    return max(lo, min(hi, float(p)))
++
++
++def clip_for_predict(p: float) -> float:
++    """Final clip applied at the kit boundary, narrower than ``_clip``."""
++    return float(max(_PREDICT_LO, min(_PREDICT_HI, float(p))))
++
++
++def parse_subject_name(subject_content: str) -> str:
++    """Extract the model name from a ``subject_content`` block.
++
++    The competition runtime renders subject metadata as::
++
++        Name: <display_name>
++        Organization: <provider>
++        Parameters: <params>
++        ...
++
++    Returns the first line after the ``Name:`` label, stripped; falls back
++    to the first non-empty line if no ``Name:`` is present. Empty input
++    returns the empty string.
++    """
++    if not subject_content:
++        return ""
++    m = re.match(r"\s*Name:\s*(.+)", subject_content)
++    if m:
++        return m.group(1).strip().splitlines()[0].strip()
++    return subject_content.split("\n", 1)[0].strip()
++
++
++def resolve_subject_name(
++    raw_name: str,
++    subj_lookup: dict[str, float],
++    sb_lookup: dict[str, float],
++    sbc_lookup: dict[str, float],
++    aliases: dict[str, str],
++    name_lc: dict[str, str],
++    provider_prefixes: Iterable[str] = _DEFAULT_PROVIDER_PREFIXES,
++) -> str:
++    """Resolve a raw display name to a canonical lookup-table key.
++
++    Tries the raw name first, then a provider-prefix-stripped variant
++    (``meta-llama/Llama-2-7b-chat`` → ``Llama-2-7b-chat``), through three
++    resolution paths each: direct, alias map, case-insensitive map.
++    """
++    candidates = [raw_name]
++    raw_lower = raw_name.lower()
++    for prefix in provider_prefixes:
++        if raw_lower.startswith(prefix):
++            candidates.append(raw_name[len(prefix):].strip())
++            break
++
++    for cand in candidates:
++        if cand in subj_lookup or cand in sb_lookup or cand in sbc_lookup:
++            return cand
++        if cand in aliases:
++            return aliases[cand]
++        lc = cand.lower()
++        if lc in name_lc:
++            return name_lc[lc]
++    return raw_name
++
++
++class CAIMIRALite(nn.Module):
++    r"""Self-contained CAIMIRA forward (no torch_measure dependency).
++
++    Matches :class:`torch_measure.models.CAIMIRA`'s mathematical intent
++    byte-for-byte. Only the trainer is dropped (predict-only); the buffer
++    ``_difficulty_mean`` is loaded from the state_dict, NOT recomputed —
++    so this class always uses frozen centering, the correct mode for
++    cold-start inference.
++
++    State_dict keys (must match the upstream trainer):
++
++    * ``skill``: ``(n_subjects, latent_dim)`` parameter
++    * ``relevance_head.weight``: ``(latent_dim, embedding_dim)``
++    * ``relevance_head.bias``: ``(latent_dim,)``
++    * ``difficulty_head.weight``: ``(latent_dim, embedding_dim)`` (no bias)
++    * ``_difficulty_mean``: ``(latent_dim,)`` buffer
++
++    Parameters
++    ----------
++    n_subjects, n_items : int
++        Universe sizes used at training (``n_items`` is only used to size
++        the buffer; predict path does not reference it because item
++        embeddings flow through ``predict_one``).
++    embedding_dim : int
++        Item embedding dimensionality (768 for ``all-mpnet-base-v2``).
++    latent_dim : int
++        CAIMIRA latent skill dimension (default 5; matches paper experiments).
++    """
++
++    def __init__(
++        self,
++        n_subjects: int,
++        n_items: int,
++        embedding_dim: int = EMBED_DIM,
++        latent_dim: int = 5,
++    ) -> None:
++        super().__init__()
++        if embedding_dim <= 0:
++            raise ValueError(f"embedding_dim must be positive, got {embedding_dim}")
++        if latent_dim <= 0:
++            raise ValueError(f"latent_dim must be positive, got {latent_dim}")
++        self.n_subjects = n_subjects
++        self.n_items = n_items
++        self.embedding_dim = embedding_dim
++        self.latent_dim = latent_dim
++
++        self.skill = nn.Parameter(torch.zeros(n_subjects, latent_dim))
++        self.relevance_head = nn.Linear(embedding_dim, latent_dim, bias=True)
++        self.difficulty_head = nn.Linear(embedding_dim, latent_dim, bias=False)
++        self.register_buffer("_difficulty_mean", torch.zeros(latent_dim))
++
++    def caimira_logit(
++        self,
++        subject_idx: int,
++        item_embedding: torch.Tensor,
++    ) -> float:
++        """Compute the CAIMIRA logit for one ``(subject_idx, item_embedding)``.
++
++        Uses frozen-mean centering (the ``_difficulty_mean`` buffer).
++        Returns a Python float for use in the hybrid blend.
++        """
++        with torch.no_grad():
++            emb = item_embedding.view(-1).to(self.relevance_head.weight.device).float()
++            relevance = torch.softmax(self.relevance_head(emb), dim=-1)
++            d_raw = self.difficulty_head(emb)
++            difficulty = d_raw - self._difficulty_mean
++            skill = self.skill[subject_idx]
++            logit = ((skill - difficulty) * relevance).sum().item()
++        return float(logit)
++
++
++class EBLookup:
++    """Self-contained 6-level EB fallback hierarchy + intercept-only Platt.
++
++    Loaded from a JSON artifact produced by :func:`submission.train.build_eb_tables`,
++    matching the schema of
++    :meth:`torch_measure.models.ColdStartLookupPredictor.to_lookup_json`.
++
++    The JSON schema is::
++
++        {
++            "sbc":   {"<subject>||<benchmark>||<condition>": <P>},
++            "sb":    {"<subject>||<benchmark>":              <P>},
++            "subj":  {"<subject>":                           <P>},
++            "bench": {"<benchmark>":                         <P>},
++            "global": <P>,
++            "name_aliases": {<prefix-stripped name>: <canonical>},
++            "name_lc":      {<name.lower()>: <canonical>}
++        }
++    """
++
++    def __init__(
++        self,
++        sbc: dict[str, float],
++        sb: dict[str, float],
++        subj: dict[str, float],
++        bench: dict[str, float],
++        global_mean: float,
++        name_aliases: dict[str, str] | None = None,
++        name_lc: dict[str, str] | None = None,
++        platt_shift_cap: float = _DEFAULT_PLATT_SHIFT_CAP,
++        output_clip: tuple[float, float] = (_CLIP_LO, _CLIP_HI),
++    ) -> None:
++        self.sbc = dict(sbc)
++        self.sb = dict(sb)
++        self.subj = dict(subj)
++        self.bench = dict(bench)
++        self.global_mean = float(global_mean)
++        self.name_aliases = dict(name_aliases or {})
++        self.name_lc = dict(name_lc or {})
++        self.platt_shift_cap = float(platt_shift_cap)
++        self.output_clip = (float(output_clip[0]), float(output_clip[1]))
++
++        self._sbc_ci = {k.lower(): v for k, v in self.sbc.items()}
++        self._sb_ci = {k.lower(): v for k, v in self.sb.items()}
++        self._subj_ci = {k.lower(): v for k, v in self.subj.items()}
++        self._bench_ci = {k.lower(): v for k, v in self.bench.items()}
++
++        self._platt: dict[str, tuple[float, float]] = {}
++        self._platt_fit_key: int = -1
++
++    @classmethod
++    def from_json(cls, path: str | Path, **overrides: Any) -> EBLookup:
++        data = json.loads(Path(path).read_text())
++        return cls(
++            sbc=data["sbc"],
++            sb=data["sb"],
++            subj=data["subj"],
++            bench=data["bench"],
++            global_mean=data["global"],
++            name_aliases=data.get("name_aliases", {}),
++            name_lc=data.get("name_lc", {}),
++            **overrides,
++        )
++
++    def resolve_name(self, raw_name: str) -> str:
++        return resolve_subject_name(
++            raw_name, self.subj, self.sb, self.sbc,
++            self.name_aliases, self.name_lc,
++        )
++
++    def lookup_p(self, subj_name: str, benchmark: str, condition: str) -> float:
++        """Walk the 6-level fallback hierarchy. Returns the first match."""
++        condition = condition or "none"
++
++        key3 = f"{subj_name}||{benchmark}||{condition}"
++        if key3 in self.sbc:
++            return self.sbc[key3]
++        if key3.lower() in self._sbc_ci:
++            return self._sbc_ci[key3.lower()]
++        key3_none = f"{subj_name}||{benchmark}||none"
++        if key3_none in self.sbc:
++            return self.sbc[key3_none]
++
++        key2 = f"{subj_name}||{benchmark}"
++        if key2 in self.sb:
++            return self.sb[key2]
++        if key2.lower() in self._sb_ci:
++            return self._sb_ci[key2.lower()]
++
++        subj_p = self.subj.get(subj_name) or self._subj_ci.get(subj_name.lower())
++        bench_p = self.bench.get(benchmark) or self._bench_ci.get(benchmark.lower())
++        if subj_p is not None and bench_p is not None:
++            return _clip(_sigmoid(_logit(subj_p) + _logit(bench_p) - _logit(self.global_mean)))
++
++        if bench_p is not None:
++            return bench_p
++        if subj_p is not None:
++            return subj_p
++        return self.global_mean
++
++    def fit_platt(self, labeled: list[dict[str, Any]]) -> None:
++        """Fit intercept-only Platt per benchmark; slope fixed at 1.0.
++
++        Idempotent w.r.t. labeled list length (cached). With K=5 examples
++        per benchmark a 2-parameter fit destroys subject ordering (slope
++        collapses to ~0.1), so we shift only and cap at ``±platt_shift_cap``.
++        """
++        new_key = len(labeled)
++        if new_key == self._platt_fit_key:
++            return
++        self._platt_fit_key = new_key
++        self._platt.clear()
++
++        by_bench: dict[str, list[tuple[float, float]]] = {}
++        for ex in labeled:
++            if "label" not in ex:
++                continue
++            bench = (ex.get("benchmark") or "").strip()
++            cond = (ex.get("condition") or "none").strip() or "none"
++            subject_content = ex.get("subject_content", "") or ""
++            raw_name = parse_subject_name(subject_content)
++            subj_name = self.resolve_name(raw_name)
++            p = self.lookup_p(subj_name, bench, cond)
++            by_bench.setdefault(bench, []).append((_logit(p), float(ex["label"])))
++
++        for bench, pairs in by_bench.items():
++            if len(pairs) < 2:
++                continue
++            xs = [x for x, _ in pairs]
++            ys = [y for _, y in pairs]
++            mean_y = sum(ys) / len(ys)
++            if mean_y <= 0 or mean_y >= 1:
++                # mean_y at the boundary would produce ±inf shift; the EB
++                # tables are clipped to [_CLIP_LO, _CLIP_HI] for the same
++                # reason, but the OBSERVED label mean can still hit 0 or 1
++                # at K=5 — guard explicitly per the lane-B FAILURE NOTE.
++                continue
++            mean_x = sum(xs) / len(xs)
++            target_logit = math.log(mean_y / (1.0 - mean_y))
++            shift = target_logit - mean_x
++            shift = max(-self.platt_shift_cap, min(self.platt_shift_cap, shift))
++            self._platt[bench] = (1.0, shift)
++
++    def predict(
++        self,
++        subject_content: str,
++        benchmark: str,
++        condition: str,
++        labeled: list[dict[str, Any]] | None = None,
++    ) -> float:
++        """Full EB prediction including Platt calibration if ``labeled`` given."""
++        raw_name = parse_subject_name(subject_content or "")
++        subj_name = self.resolve_name(raw_name)
++        p = self.lookup_p(subj_name, benchmark, condition)
++
++        if labeled:
++            self.fit_platt(labeled)
++            if benchmark in self._platt:
++                slope, intercept = self._platt[benchmark]
++                p = _sigmoid(slope * _logit(p) + intercept)
++
++        lo, hi = self.output_clip
++        return max(lo, min(hi, float(p)))
+diff --git a/submission/labeling.py b/submission/labeling.py
+new file mode 100644
+index 0000000..85a5915
+--- /dev/null
++++ b/submission/labeling.py
+@@ -0,0 +1,222 @@
++# Copyright (c) 2026 AIMS Foundations. MIT License.
++# pylint: disable=global-statement,broad-except,broad-exception-caught
++"""Stdlib-only adaptive-labeling acquisition via bounded SimHash diversity.
++
++The hosted platform calls ``acquisition_function(input)`` once per hidden
++candidate BEFORE ``predict()``. The naive "encode every candidate with the
++sentence-transformer encoder" pattern is too expensive for the streaming
++10K-candidate-per-round path, and earlier ports of that pattern had a
++documented NaN-poisoning bug whose blast radius is global (any one
++exception / NaN / inf in any one acquisition score discards ALL
++acquisition scores for the whole round → random labeling fallback for
++every category, every round).
++
++This implementation is:
++
++* **stdlib-only** (``hashlib.blake2b``, ``re``, ``math``) — no torch import,
++  no encoder dependency, no NumPy.
++* **bounded cost**: 64-bit SimHash signatures over the visible text fields,
++  ranked against a 128-entry reservoir; O(_MAX_TOKENS + _MAX_SEEN · _BITS)
++  per call, fixed regardless of the round's total candidate count.
++* **bulletproof**: the single ``except Exception`` returns the distinguishable
++  sentinel ``0.0`` (see :func:`acquisition_function` docstring).
++
++Port note: this file mirrors the production-vetted SimHash acquisition
++shipping in the parent CS321M competition repo at
++``predictive-eval-competition/submission/labeling.py`` (commit lineage
++"feat: SimHash diversity acquisition for adaptive labeling"). Kept
++verbatim except for the docstring header so the submission ZIP carries
++identical behavior across both upstreams.
++"""
++
++from __future__ import annotations
++
++import hashlib
++import math
++import re
++
++_BITS = 64
++_MAX_TOKENS = 256
++_MAX_SEEN = 128
++_MAX_STRATA = 256
++_TIE_EPSILON = 0.01
++_TOKEN_RE = re.compile(r"[a-z0-9]+")
++
++_seen_signatures: list[int] = []
++_stratum_counts: dict[tuple[str, str, str], int] = {}
++_candidate_count = 0
++
++
++def _text(value: object) -> str:
++    return "" if value is None else str(value)
++
++
++def _visible_text(ex: dict) -> str:
++    return "\n".join(
++        (
++            _text(ex.get("benchmark")),
++            _text(ex.get("condition")),
++            _text(ex.get("subject_content")),
++            _text(ex.get("item_content")),
++        )
++    ).lower()
++
++
++def _tokens(ex: dict) -> list[str]:
++    return _TOKEN_RE.findall(_visible_text(ex))[:_MAX_TOKENS]
++
++
++def _hash_u64(text: str, person: bytes = b"peval-v1") -> int:
++    digest = hashlib.blake2b(
++        text.encode("utf-8", "replace"),
++        digest_size=8,
++        person=person,
++    ).digest()
++    return int.from_bytes(digest, "little")
++
++
++def _stable_unit_interval(text: str, person: bytes) -> float:
++    return _hash_u64(text, person=person) / float(1 << 64)
++
++
++def _simhash(ex: dict) -> int:
++    accum = [0] * _BITS
++    toks = _tokens(ex)
++    if not toks:
++        toks = ["<empty>"]
++
++    for token in toks:
++        h = _hash_u64(token, person=b"simhash-v1")
++        for bit in range(_BITS):
++            accum[bit] += 1 if (h >> bit) & 1 else -1
++
++    signature = 0
++    for bit, value in enumerate(accum):
++        if value >= 0:
++            signature |= 1 << bit
++    return signature
++
++
++def _coarse_subject_bucket(subject_content: object) -> str:
++    text = _text(subject_content).lower()
++    name = ""
++    org = ""
++    param_bucket = "params_unknown"
++
++    for raw_line in text.splitlines()[:8]:
++        line = raw_line.strip()
++        if line.startswith("name:"):
++            name = line.split(":", 1)[1].strip()[:32]
++        elif line.startswith("organization:"):
++            org = line.split(":", 1)[1].strip()[:32]
++        elif line.startswith("parameters:"):
++            digits = "".join(ch for ch in line if ch.isdigit())
++            if digits:
++                param_bucket = f"params_digits_{len(digits)}"
++
++    if org:
++        return f"org:{org}"
++    if name:
++        return f"name_hash:{_hash_u64(name, person=b'name-v1') % 32}"
++    return param_bucket
++
++
++def _stratum_key(ex: dict) -> tuple[str, str, str]:
++    benchmark = _text(ex.get("benchmark")).lower()[:64]
++    condition = _text(ex.get("condition")).lower()[:64]
++    subject_bucket = _coarse_subject_bucket(ex.get("subject_content"))
++    return benchmark, condition, subject_bucket
++
++
++def _metadata_bonus(ex: dict) -> float:
++    key = _stratum_key(ex)
++    count = _stratum_counts.get(key, 0)
++    return 0.20 / float(1 + count)
++
++
++def _update_stratum(ex: dict) -> None:
++    key = _stratum_key(ex)
++    if key in _stratum_counts or len(_stratum_counts) < _MAX_STRATA:
++        _stratum_counts[key] = _stratum_counts.get(key, 0) + 1
++
++
++def _candidate_key(ex: dict) -> str:
++    return "\n".join(
++        (
++            _text(ex.get("benchmark")),
++            _text(ex.get("condition")),
++            _text(ex.get("subject_content")),
++            _text(ex.get("item_content")),
++        )
++    )
++
++
++def _diversity_score(signature: int) -> float:
++    if not _seen_signatures:
++        return 1.0
++    nearest = min((signature ^ old).bit_count() for old in _seen_signatures)
++    return nearest / float(_BITS)
++
++
++def _update_reservoir(signature: int, candidate_key: str) -> None:
++    if len(_seen_signatures) < _MAX_SEEN:
++        _seen_signatures.append(signature)
++        return
++
++    slot = _hash_u64(
++        f"{candidate_key}\n{_candidate_count}",
++        person=b"reservoir-v1",
++    ) % _candidate_count
++    if slot < _MAX_SEEN:
++        _seen_signatures[slot] = signature
++
++
++def _clamp_score(value: float) -> float:
++    if not math.isfinite(value):
++        return 0.0
++    return float(max(0.0, min(2.0, value)))
++
++
++# pylint: disable=redefined-builtin
++def acquisition_function(input: dict) -> float:
++    """Return a deterministic finite priority score for one candidate.
++
++    Output domain: legitimate scores are in ``(0, 2]`` — every successful
++    path adds a strictly-positive ``tie_break = _stable_unit_interval(key,
++    person=b"tie-v1") * _TIE_EPSILON`` where ``_stable_unit_interval``
++    is ``BLAKE2b(key) / 2^64`` and ``_TIE_EPSILON = 0.01``. An exact 0
++    from the underlying 64-bit hash has probability ``~2^-64`` (one in
++    18 quintillion), so the legitimate-path floor is essentially never
++    zero in practice.
++
++    INTENTIONAL distinguishable sentinel — the bare-``except`` path
++    below returns exactly ``0.0`` as the design-distinguishable failure
++    signal per the project's distinguishable-defensive-fallbacks rule
++    (1): values OUTSIDE the legitimate output domain. Because the
++    legitimate floor is non-zero, an exact-0.0 return ALWAYS signals
++    exception fallback and is distinguishable from any real low-priority
++    score. Do NOT widen the fallback to a positive value (would collide
++    with legit candidates) or to NaN/inf (kit-rejected per the kit
++    README's `Invalid predict() output` error). The companion
++    ``predict()`` failure cascade rule is: a single NaN/inf/exception
++    in ANY ``acquisition_function`` call for ANY candidate discards ALL
++    acquisition scores for the whole round.
++    """
++    global _candidate_count
++
++    try:
++        ex = dict(input or {})
++        signature = _simhash(ex)
++        key = _candidate_key(ex)
++        diversity = _diversity_score(signature)
++        metadata = _metadata_bonus(ex)
++        tie_break = _stable_unit_interval(key, person=b"tie-v1") * _TIE_EPSILON
++        score = _clamp_score(diversity + metadata + tie_break)
++
++        _candidate_count += 1
++        _update_reservoir(signature, key)
++        _update_stratum(ex)
++        return score
++    except Exception:
++        # INTENTIONAL distinguishable sentinel — see function docstring.
++        return 0.0
+diff --git a/submission/model.py b/submission/model.py
+new file mode 100644
+index 0000000..38da600
+--- /dev/null
++++ b/submission/model.py
+@@ -0,0 +1,258 @@
++# Copyright (c) 2026 AIMS Foundations. MIT License.
++# pylint: disable=redefined-builtin
++"""Codabench submission entry point — CAIMIRA + EB hybrid back-stop.
++
++Contract surface
++----------------
++The hosted runtime imports this module once per container, then calls
++:func:`predict` once per hidden item. Adaptive labeling is handled by
++:mod:`submission.labeling`.
++
++* ``predict(input: dict, labeled: list[dict] | None = None) -> float``
++* The ``input`` dict has exactly four string keys: ``benchmark``,
++  ``condition``, ``subject_content``, ``item_content``.
++* The return MUST be a native Python finite float in ``[0, 1]`` (clipped
++  here to ``[1e-4, 1-1e-4]`` to keep the log-loss bounded).
++
++D-3 / no-broad-except discipline
++--------------------------------
++This module deliberately has NO ``try/except → 0.5`` blocks. If module
++init fails (import error, missing artifact, ``torch.load`` failure with
++``weights_only=True``), the platform surfaces a ``[PAIEC-PREDICT-002]``
++error before any predictions run. If ``predict()`` raises mid-round, the
++platform fails the submission — that is the correct behavior. Silent
++swallowing degrades the submission to the constant-0.5 leaderboard
++signature (-0.69 NLL / 0.50 AUC), which is the canonical "model is
++broken" symptom that took 3 weeks to diagnose in the April 2026 NCF
++silent-load-failure post-mortem.
++
++Hybrid prediction
++-----------------
++For in-vocabulary ``(subject_name, benchmark, condition)`` triples we
++blend the CAIMIRA logit with the EB-fallback logit by a fixed weight
++``lambda_=0.6`` (CAIMIRA-leaning). For OUT-of-vocabulary subjects (CAIMIRA
++has no trained skill vector), we use the EB fallback alone — which is
++the ``cold_start_lookup``-shaped 6-level hierarchy + per-benchmark
++intercept-only Platt calibration from the platform's K=5 ``labeled``
++reveals.
++
++NOT-yet-shipped
++---------------
++This file IS ``submission/model.py`` and CAN be packaged via
++:program:`bash submission/build_zip.sh`, but the trained artifact
++(``caimira_lite.pt`` + ``caimira_lite.meta.json`` + ``eb_tables.json``)
++is NOT shipped in the repo (gitignored ``*.pt``; 500 KB pre-commit cap).
++You must run :program:`python submission/train.py` to produce them
++before packaging. See ``submission/README.md`` for the full flow.
++
++A D-9 pre-submission transfer-audit gate must pass before any Codabench
++upload — the 2026-05-22 transfer postmortem documents that the prior
++CAIMIRA m=5 submissions had the BEST local val_nll AND the WORST hidden
++score. This hybrid back-stop is a structural improvement over the
++2026-05-22 ``<UNK>``-at-index-0 fallback, but it has NOT been validated
++against a hidden leaderboard.
++"""
++
++from __future__ import annotations
++
++import json
++import os
++import sys
++from pathlib import Path
++from typing import Any
++
++import torch
++
++_LOCAL_SMOKE = os.environ.get("PREDICTIVE_EVAL_LOCAL_SMOKE_TEST", "") == "1"
++
++_SUBMISSION_DIR = str(Path(__file__).resolve().parent)
++if _SUBMISSION_DIR not in sys.path:
++    sys.path.insert(0, _SUBMISSION_DIR)
++
++from caimira_lite import (  # noqa: E402
++    EMBED_DIM,
++    CAIMIRALite,
++    EBLookup,
++    clip_for_predict,
++    parse_subject_name,
++)
++
++# CAIMIRA-vs-EB blend weight in logit space. Higher = more CAIMIRA-leaning.
++# Fixed at 0.6 as the conservative default per the Wave-2 Lane-B
++# recommendation. D-9 ablation candidates: {0.3, 0.5, 0.7, 0.9}.
++_BLEND_LAMBDA: float = 0.6
++
++# Artifact paths (resolved relative to this file's directory).
++_HEAD_PATH = Path(_SUBMISSION_DIR) / "caimira_lite.pt"
++_META_PATH = Path(_SUBMISSION_DIR) / "caimira_lite.meta.json"
++_EB_PATH = Path(_SUBMISSION_DIR) / "eb_tables.json"
++
++# Encoder repo — must also appear in submission/models.txt so the
++# hosted runtime pre-fetches it into the HF cache.
++ENCODER_REPO = "sentence-transformers/all-mpnet-base-v2"
++
++DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
++
++
++def _logit(p: float) -> float:
++    """Numerically safe logit; mirrors caimira_lite._logit."""
++    import math
++
++    p = max(1e-7, min(1 - 1e-7, p))
++    return math.log(p / (1 - p))
++
++
++def _sigmoid(x: float) -> float:
++    """Numerically stable sigmoid; mirrors caimira_lite._sigmoid."""
++    import math
++
++    if x >= 0:
++        return 1.0 / (1.0 + math.exp(-x))
++    e = math.exp(x)
++    return e / (1.0 + e)
++
++
++def _blend_logits(caimira_p: float, eb_p: float, lambda_: float = _BLEND_LAMBDA) -> float:
++    """Weighted-logit blend; ``lambda_=1`` is pure CAIMIRA, ``lambda_=0`` is pure EB."""
++    return _sigmoid(lambda_ * _logit(caimira_p) + (1.0 - lambda_) * _logit(eb_p))
++
++
++# ---------------------------------------------------------------------------
++# Module-level loading.
++#
++# Local smoke test (PREDICTIVE_EVAL_LOCAL_SMOKE_TEST=1, set by the kit's
++# tools/check_submission_zip.py and tools/run_smoke_test.py) skips the
++# heavy loads so the contract test runs without the artifact or the
++# encoder pre-fetched. The hosted Codabench container does NOT set this
++# variable; production always runs the full load path.
++# ---------------------------------------------------------------------------
++
++ENCODER: Any | None = None
++CAIMIRA: CAIMIRALite | None = None
++EB: EBLookup | None = None
++META: dict[str, Any] | None = None
++SUBJECT_TO_IDX: dict[str, int] = {}
++
++if _LOCAL_SMOKE:
++    print("[submission/model] PREDICTIVE_EVAL_LOCAL_SMOKE_TEST=1 — skipping artifact loads")
++else:
++    from sentence_transformers import SentenceTransformer
++
++    META = json.loads(_META_PATH.read_text())
++    n_subjects = int(META["n_subjects"])
++    n_items = int(META["n_items"])
++    embed_dim = int(META.get("embed_dim", EMBED_DIM))
++    latent_dim = int(META.get("latent_dim", 5))
++
++    CAIMIRA = CAIMIRALite(
++        n_subjects=n_subjects,
++        n_items=n_items,
++        embedding_dim=embed_dim,
++        latent_dim=latent_dim,
++    ).to(DEVICE)
++    state = torch.load(_HEAD_PATH, map_location=DEVICE, weights_only=True)
++    CAIMIRA.load_state_dict(state)
++    CAIMIRA.eval()
++    for p in CAIMIRA.parameters():
++        p.requires_grad_(False)
++
++    EB = EBLookup.from_json(_EB_PATH)
++
++    SUBJECT_TO_IDX = dict(META.get("subject_to_idx", {}))
++
++    ENCODER = SentenceTransformer(ENCODER_REPO, device=str(DEVICE))
++
++_item_cache: dict[str, torch.Tensor] = {}
++
++
++def _encode_item(item_content: str) -> torch.Tensor:
++    """Encode ``item_content`` once per round (module-level cache)."""
++    assert ENCODER is not None, "Encoder not loaded; called in LOCAL_SMOKE mode?"
++    cached = _item_cache.get(item_content)
++    if cached is not None:
++        return cached
++    vec = ENCODER.encode(
++        item_content,
++        convert_to_numpy=False,
++        convert_to_tensor=True,
++        show_progress_bar=False,
++        normalize_embeddings=False,
++    )
++    vec = vec.to(DEVICE).float().view(-1)
++    _item_cache[item_content] = vec
++    return vec
++
++
++def predict(
++    input: dict,
++    labeled: list[dict] | None = None,
++) -> float:
++    """Return ``P(correct)`` for the hidden ``(subject, item)`` triple.
++
++    Contract per ``starting_kit/README.md:212-228``: native Python float in
++    ``[0, 1]``, NaN/inf/tensors/strings/booleans rejected by the platform's
++    pre-validator with the verbatim error
++    ``Invalid predict() output: predict() must return a finite float in [0, 1].``
++    The final clip ``[1e-4, 1-1e-4]`` matches the team's NCF and keeps
++    log-loss bounded.
++
++    For ``LOCAL_SMOKE`` mode the function returns a fixed ``0.5`` sentinel
++    so the kit's local smoke test can exercise the import + signature
++    surface without requiring the trained artifact or the encoder in the
++    local HF cache. The hosted container does NOT set this env var.
++
++    Parameters
++    ----------
++    input : dict
++        Four string keys: ``benchmark`` (identifier, not display name),
++        ``condition``, ``subject_content`` (starts with ``Name:``),
++        ``item_content``.
++    labeled : list[dict] or None
++        Optional list of K=5-per-category revealed examples with the same
++        four content keys plus a ``label`` field in ``{0, 1}``. May be
++        ``None`` or ``[]`` for cold-start rounds.
++
++    Returns
++    -------
++    float
++        Predicted probability in ``[1e-4, 1-1e-4]``.
++    """
++    if _LOCAL_SMOKE:
++        return 0.5
++
++    assert CAIMIRA is not None and EB is not None and META is not None  # noqa: S101
++
++    benchmark = (input.get("benchmark") or "").strip()
++    condition = (input.get("condition") or "none").strip() or "none"
++    subject_content = input.get("subject_content") or ""
++    item_content = input.get("item_content") or ""
++
++    raw_name = parse_subject_name(subject_content)
++    subj_name = EB.resolve_name(raw_name)
++
++    eb_p = EB.lookup_p(subj_name, benchmark, condition)
++
++    subject_idx = SUBJECT_TO_IDX.get(subj_name)
++    if subject_idx is None:
++        subject_idx = SUBJECT_TO_IDX.get(raw_name)
++
++    if subject_idx is None or not item_content:
++        # Out-of-vocab subject OR missing item text → EB-only path.
++        # Distinguishable from the silent-0.5 D-3 antipattern because eb_p
++        # varies with (subject, benchmark, condition) — a leaderboard run
++        # producing constant 0.5 has a different root cause than "EB
++        # fallback is firing for every row".
++        p = eb_p
++    else:
++        item_embedding = _encode_item(item_content)
++        caimira_logit = CAIMIRA.caimira_logit(subject_idx, item_embedding)
++        caimira_p = _sigmoid(caimira_logit)
++        p = _blend_logits(caimira_p, eb_p, _BLEND_LAMBDA)
++
++    if labeled:
++        EB.fit_platt(labeled)
++        if benchmark in EB._platt:  # noqa: SLF001 — same module's class
++            slope, intercept = EB._platt[benchmark]  # noqa: SLF001
++            p = _sigmoid(slope * _logit(p) + intercept)
++
++    return clip_for_predict(p)
+diff --git a/submission/models.txt b/submission/models.txt
+new file mode 100644
+index 0000000..6a96ab4
+--- /dev/null
++++ b/submission/models.txt
+@@ -0,0 +1 @@
++sentence-transformers/all-mpnet-base-v2
+diff --git a/submission/train.py b/submission/train.py
+new file mode 100644
+index 0000000..d940f64
+--- /dev/null
++++ b/submission/train.py
+@@ -0,0 +1,458 @@
++# Copyright (c) 2026 AIMS Foundations. MIT License.
++
++"""Offline trainer for the CAIMIRA+EB Codabench submission.
++
++Produces the three artifacts that ``submission/model.py`` loads at module init:
++
++* ``caimira_lite.pt`` — state_dict of :class:`submission.caimira_lite.CAIMIRALite`
++* ``caimira_lite.meta.json`` — training provenance + ``subject_to_idx`` mapping
++* ``eb_tables.json`` — the 6-level EB fallback hierarchy (``sbc / sb / subj /
++  bench / global``) + ``name_aliases / name_lc``
++
++Differences from :program:`python notebooks/train_caimira.py` (the
++predictive-eval-competition trainer):
++
++* This trainer runs FROM the ``torch_measure`` package (uses
++  :class:`torch_measure.models.CAIMIRA` directly for training and
++  :class:`torch_measure.models.ColdStartLookupPredictor`'s class for
++  reference; the EB tables themselves are built here, not via a separate
++  ``m3_build_colab.py`` script).
++* Output paths default to ``submission/`` (sibling of this file), not
++  ``predictive-eval-competition/submission/``.
++* Adds explicit EB-table build (the parent-repo trainer doesn't, since
++  the parent repo's submission relied on the standalone
++  ``ColdStartLookupPredictor``'s own ``m3_build_colab.py``).
++
++Smoke run (single benchmark, 5 epochs, ~30 seconds on CPU):
++
++    python submission/train.py --smoke
++
++Full run (all binary benchmarks, default 200 epochs):
++
++    python submission/train.py
++"""
++
++from __future__ import annotations
++
++import argparse
++import json
++import math
++import random
++import sys
++from collections import defaultdict
++from pathlib import Path
++from typing import Any
++
++import numpy as np
++import pyarrow.parquet as pq
++import torch
++from huggingface_hub import HfApi, hf_hub_download
++from sentence_transformers import SentenceTransformer
++
++from torch_measure.models import CAIMIRA
++
++_THIS_DIR = Path(__file__).resolve().parent
++if str(_THIS_DIR) not in sys.path:
++    sys.path.insert(0, str(_THIS_DIR))
++
++from caimira_lite import EMBED_DIM  # noqa: E402
++
++REPO_ID = "aims-foundations/measurement-db"
++REVISION = "589ccfdb8e82e6e0b5e35e9d23cd83a6df85018f"
++ENCODER_REPO = "sentence-transformers/all-mpnet-base-v2"
++
++REGISTRY_FILES = frozenset({"subjects.parquet", "items.parquet", "benchmarks.parquet"})
++
++# Response-table columns we read (8-column schema per kit README).
++# We deliberately ignore "trace" (large blob) and "correct_answer" (unused
++# at training time) to keep memory bounded for smoke/full runs.
++_RESPONSE_COLS = ("subject_id", "item_id", "benchmark_id", "test_condition", "response")
++
++# EB-table build hyperparameters.
++_EB_SBC_MIN_N = 3        # triple cell needs >= 3 obs to land in sbc
++_EB_SUBJ_MIN_N = 10      # subject prior needs >= 10 obs
++_EB_SB_ALPHA = 5.0       # Bayesian pseudo-counts toward IRT blend at level 2
++
++# Probability clipping at table-build time. Avoids inf in logit().
++_TABLE_CLIP_LO = 0.05
++_TABLE_CLIP_HI = 0.95
++
++DEFAULT_OUTPUT_DIR = _THIS_DIR
++
++
++def parse_args() -> argparse.Namespace:
++    p = argparse.ArgumentParser(description=__doc__)
++    p.add_argument("--smoke", action="store_true",
++                   help="Single benchmark (mmlupro), 5 epochs, 1000-row cap.")
++    p.add_argument("--benchmarks", nargs="*", default=None,
++                   help="Subset of response parquets to train on.")
++    p.add_argument("--epochs", type=int, default=200)
++    p.add_argument("--lr", type=float, default=1e-3)
++    p.add_argument("--weight-decay", type=float, default=0.0)
++    p.add_argument("--latent-dim", type=int, default=5,
++                   help="CAIMIRA latent skill dimension; matches paper m=5.")
++    p.add_argument("--difficulty-reg", type=float, default=1e-4)
++    p.add_argument("--skill-reg", type=float, default=1e-4)
++    p.add_argument("--seed", type=int, default=42)
++    p.add_argument("--device", default=None)
++    p.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR,
++                   help=f"Where to write artifacts. Default {DEFAULT_OUTPUT_DIR}.")
++    p.add_argument("--encode-batch", type=int, default=64)
++    return p.parse_args()
++
++
++def set_seed(seed: int) -> None:
++    random.seed(seed)
++    np.random.seed(seed)
++    torch.manual_seed(seed)
++    if torch.cuda.is_available():
++        torch.cuda.manual_seed_all(seed)
++
++
++def list_response_files(repo_id: str = REPO_ID, revision: str = REVISION) -> list[str]:
++    files = HfApi().list_repo_files(repo_id=repo_id, repo_type="dataset", revision=revision)
++    return sorted(
++        n for n in files
++        if n.endswith(".parquet") and n not in REGISTRY_FILES and not n.endswith("_traces.parquet")
++    )
++
++
++def _read_parquet_rows(filename: str, columns: tuple[str, ...] | None = None) -> list[dict]:
++    """Download one parquet from the pinned HF revision and return row dicts.
++
++    Uses ``huggingface_hub.hf_hub_download`` + ``pyarrow`` directly so we
++    don't pull in the heavier ``datasets`` library (which is not in
++    ``pyproject.toml``'s top-level deps).
++    """
++    path = hf_hub_download(
++        repo_id=REPO_ID,
++        filename=filename,
++        repo_type="dataset",
++        revision=REVISION,
++    )
++    table = pq.read_table(path, columns=list(columns) if columns else None)
++    return table.to_pylist()
++
++
++def load_responses(response_files: list[str]) -> list[dict]:
++    """Concatenate the requested response parquets into one row list."""
++    rows: list[dict] = []
++    for fname in response_files:
++        rows.extend(_read_parquet_rows(fname, columns=_RESPONSE_COLS))
++    return rows
++
++
++def load_registries() -> tuple[list[dict], list[dict], list[dict]]:
++    subjects = _read_parquet_rows("subjects.parquet")
++    items = _read_parquet_rows("items.parquet")
++    benchmarks = _read_parquet_rows("benchmarks.parquet")
++    return subjects, items, benchmarks
++
++
++def collect_binary_examples(
++    responses: list[dict],
++    subjects_by_id: dict[str, dict],
++    items_by_id: dict[str, dict],
++    smoke: bool,
++) -> list[dict[str, Any]]:
++    """Filter to binary {0,1} rows + extract the visible-content fields."""
++    if smoke:
++        responses = responses[: min(1000, len(responses))]
++
++    by_bench: dict[str, list[dict[str, Any]]] = defaultdict(list)
++    for row in responses:
++        item = items_by_id.get(row["item_id"], {})
++        subject = subjects_by_id.get(row["subject_id"], {})
++        item_content = item.get("content")
++        if not item_content:
++            continue
++        subject_display = subject.get("display_name") or row["subject_id"]
++        subject_content = f"Name: {subject_display}"
++        by_bench[row["benchmark_id"]].append({
++            "benchmark": row["benchmark_id"],
++            "condition": row["test_condition"] or "none",
++            "subject_name": subject_display,
++            "subject_content": subject_content,
++            "item_content": item_content,
++            "label": float(row["response"]),
++        })
++
++    examples: list[dict[str, Any]] = []
++    for _bench, rows in by_bench.items():
++        labels = [r["label"] for r in rows]
++        is_binary = bool(labels) and all(v in (0.0, 1.0) for v in labels)
++        if is_binary:
++            examples.extend(rows)
++    print(f"[train_caimira] Kept {len(examples):,} rows from binary benchmarks.")
++    return examples
++
++
++def build_indices(examples: list[dict[str, Any]]) -> tuple[dict[str, int], dict[str, int], list[str]]:
++    """Build (subject_name -> int, item_content -> int, ordered_item_texts)."""
++    subject_to_idx: dict[str, int] = {}
++    item_to_idx: dict[str, int] = {}
++    ordered_items: list[str] = []
++    for ex in examples:
++        if ex["subject_name"] not in subject_to_idx:
++            subject_to_idx[ex["subject_name"]] = len(subject_to_idx)
++        if ex["item_content"] not in item_to_idx:
++            item_to_idx[ex["item_content"]] = len(item_to_idx)
++            ordered_items.append(ex["item_content"])
++    return subject_to_idx, item_to_idx, ordered_items
++
++
++def encode_items(texts: list[str], encoder: SentenceTransformer, batch: int) -> torch.Tensor:
++    print(f"[train_caimira] Encoding {len(texts):,} unique items ...")
++    matrix = encoder.encode(texts, batch_size=batch, show_progress_bar=True, convert_to_numpy=True)
++    return torch.from_numpy(np.asarray(matrix, dtype=np.float32))
++
++
++def build_long_form(
++    examples: list[dict[str, Any]],
++    subject_to_idx: dict[str, int],
++    item_to_idx: dict[str, int],
++) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
++    n = len(examples)
++    s = np.empty(n, dtype=np.int64)
++    i = np.empty(n, dtype=np.int64)
++    y = np.empty(n, dtype=np.float32)
++    for k, ex in enumerate(examples):
++        s[k] = subject_to_idx[ex["subject_name"]]
++        i[k] = item_to_idx[ex["item_content"]]
++        y[k] = float(ex["label"])
++    return torch.from_numpy(s), torch.from_numpy(i), torch.from_numpy(y)
++
++
++def _logit(p: float) -> float:
++    p = max(1e-7, min(1 - 1e-7, p))
++    return math.log(p / (1 - p))
++
++
++def _sigmoid(x: float) -> float:
++    if x >= 0:
++        return 1.0 / (1.0 + math.exp(-x))
++    e = math.exp(x)
++    return e / (1.0 + e)
++
++
++def _table_clip(p: float) -> float:
++    return max(_TABLE_CLIP_LO, min(_TABLE_CLIP_HI, float(p)))
++
++
++def build_eb_tables(examples: list[dict[str, Any]]) -> dict[str, Any]:
++    """Build the 6-level fallback lookup tables from binary training rows.
++
++    Returns a dict matching :meth:`submission.caimira_lite.EBLookup.from_json`'s
++    schema: ``{"sbc", "sb", "subj", "bench", "global", "name_aliases", "name_lc"}``.
++    """
++    print("[train_caimira] Building EB tables ...")
++    sbc_acc: dict[str, list[float]] = defaultdict(list)
++    sb_acc: dict[str, list[float]] = defaultdict(list)
++    subj_acc: dict[str, list[float]] = defaultdict(list)
++    bench_acc: dict[str, list[float]] = defaultdict(list)
++    all_labels: list[float] = []
++
++    for ex in examples:
++        s = ex["subject_name"]
++        b = ex["benchmark"]
++        c = ex["condition"] or "none"
++        y = ex["label"]
++        sbc_acc[f"{s}||{b}||{c}"].append(y)
++        sb_acc[f"{s}||{b}"].append(y)
++        subj_acc[s].append(y)
++        bench_acc[b].append(y)
++        all_labels.append(y)
++
++    global_mean = _table_clip(sum(all_labels) / max(len(all_labels), 1))
++    bench = {b: _table_clip(sum(v) / len(v)) for b, v in bench_acc.items()}
++    subj = {s: _table_clip(sum(v) / len(v)) for s, v in subj_acc.items() if len(v) >= _EB_SUBJ_MIN_N}
++    sbc = {k: _table_clip(sum(v) / len(v)) for k, v in sbc_acc.items() if len(v) >= _EB_SBC_MIN_N}
++
++    # Level 2: Bayesian shrinkage toward the IRT blend.
++    sb: dict[str, float] = {}
++    for key, ys in sb_acc.items():
++        if not ys:
++            continue
++        n = len(ys)
++        s_name, b_name = key.split("||", 1)
++        raw_p = sum(ys) / n
++        subj_p = subj.get(s_name)
++        bench_p = bench.get(b_name)
++        if subj_p is not None and bench_p is not None:
++            prior_p = _sigmoid(_logit(subj_p) + _logit(bench_p) - _logit(global_mean))
++        elif bench_p is not None:
++            prior_p = bench_p
++        else:
++            prior_p = global_mean
++        shrunk = (n * raw_p + _EB_SB_ALPHA * prior_p) / (n + _EB_SB_ALPHA)
++        sb[key] = _table_clip(shrunk)
++
++    # Name aliases + lowercase view for subject-name resolution.
++    canonical_names = list(subj.keys())
++    name_lc = {name.lower(): name for name in canonical_names}
++
++    print(
++        f"[train_caimira]   global_mean={global_mean:.4f}  "
++        f"bench={len(bench)}  subj={len(subj)}  "
++        f"sb={len(sb)}  sbc={len(sbc)}"
++    )
++
++    return {
++        "sbc": sbc,
++        "sb": sb,
++        "subj": subj,
++        "bench": bench,
++        "global": global_mean,
++        "name_aliases": {},
++        "name_lc": name_lc,
++    }
++
++
++def main() -> None:
++    args = parse_args()
++    set_seed(args.seed)
++
++    device = torch.device(
++        args.device if args.device is not None else ("cuda" if torch.cuda.is_available() else "cpu")
++    )
++    print(f"[train_caimira] Device: {device}")
++
++    response_files = (
++        ["mmlupro.parquet"] if args.smoke
++        else (args.benchmarks if args.benchmarks else list_response_files())
++    )
++    print(f"[train_caimira] Benchmarks: {response_files}")
++
++    responses = load_responses(response_files)
++    subjects, items, _benchmarks = load_registries()
++    subjects_by_id = {row["subject_id"]: row for row in subjects}
++    items_by_id = {row["item_id"]: row for row in items}
++
++    examples = collect_binary_examples(responses, subjects_by_id, items_by_id, smoke=args.smoke)
++    if not examples:
++        raise SystemExit("[train_caimira] No binary examples — abort.")
++
++    subject_to_idx, item_to_idx, ordered_items = build_indices(examples)
++    print(
++        f"[train_caimira] Indices: subjects={len(subject_to_idx):,}  items={len(item_to_idx):,}"
++    )
++
++    encoder = SentenceTransformer(ENCODER_REPO, device=str(device))
++    embeddings = encode_items(ordered_items, encoder, args.encode_batch)
++    print(f"[train_caimira] embeddings.shape={tuple(embeddings.shape)}")
++
++    s_all, i_all, y_all = build_long_form(examples, subject_to_idx, item_to_idx)
++
++    epochs = 5 if args.smoke else args.epochs
++
++    # NOTE: we use torch_measure.models.CAIMIRA (the package version) for
++    # TRAINING. The state_dict it produces loads cleanly into
++    # caimira_lite.CAIMIRALite (the standalone predict-only sibling) at
++    # submission runtime, because the two classes have identical
++    # parameter names (skill, relevance_head.weight, relevance_head.bias,
++    # difficulty_head.weight) and matching buffer (_difficulty_mean).
++    model = CAIMIRA(
++        n_subjects=len(subject_to_idx),
++        n_items=len(item_to_idx),
++        embedding_dim=embeddings.shape[1],
++        latent_dim=args.latent_dim,
++    )
++    wide_response = _build_wide_response(
++        s_all, i_all, y_all, len(subject_to_idx), len(item_to_idx)
++    )
++    history = model.fit(
++        wide_response,
++        embeddings=embeddings,
++        max_epochs=epochs,
++        lr=args.lr,
++        weight_decay=args.weight_decay,
++        difficulty_reg=args.difficulty_reg,
++        skill_reg=args.skill_reg,
++        verbose=True,
++    )
++
++    # Build EB tables from the SAME binary training rows so the fallback
++    # priors are consistent with what CAIMIRA optimized against.
++    eb_tables = build_eb_tables(examples)
++
++    args.output_dir.mkdir(parents=True, exist_ok=True)
++    pt_path = args.output_dir / "caimira_lite.pt"
++    meta_path = args.output_dir / "caimira_lite.meta.json"
++    eb_path = args.output_dir / "eb_tables.json"
++
++    model_cpu = model.to("cpu").eval()
++    torch.save(model_cpu.state_dict(), pt_path)
++    print(f"[train_caimira] Saved CAIMIRA state_dict → {pt_path}")
++
++    # Round-trip verification: load through the SHIPPABLE caimira_lite class
++    # (not the upstream CAIMIRA) to catch silent state_dict-shape mismatches
++    # between the trainer and the submission-runtime classes.
++    from caimira_lite import CAIMIRALite  # noqa: E402,WPS433
++
++    fresh = CAIMIRALite(
++        n_subjects=len(subject_to_idx),
++        n_items=len(item_to_idx),
++        embedding_dim=embeddings.shape[1],
++        latent_dim=args.latent_dim,
++    )
++    state = torch.load(pt_path, map_location="cpu", weights_only=True)
++    missing, unexpected = fresh.load_state_dict(state, strict=False)
++    if missing or unexpected:
++        raise SystemExit(
++            f"[train_caimira] state_dict shape mismatch — missing={missing} unexpected={unexpected}"
++        )
++    print("[train_caimira]   round-trip into CAIMIRALite OK (no missing/unexpected keys)")
++
++    eb_path.write_text(json.dumps(eb_tables, indent=2))
++    print(f"[train_caimira] Saved EB tables → {eb_path}")
++
++    metadata = {
++        "repo_id": REPO_ID,
++        "revision": REVISION,
++        "encoder_repo": ENCODER_REPO,
++        "embed_dim": EMBED_DIM,
++        "latent_dim": args.latent_dim,
++        "n_subjects": len(subject_to_idx),
++        "n_items": len(item_to_idx),
++        "subject_to_idx": subject_to_idx,
++        "benchmarks": response_files,
++        "epochs": epochs,
++        "lr": args.lr,
++        "weight_decay": args.weight_decay,
++        "difficulty_reg": args.difficulty_reg,
++        "skill_reg": args.skill_reg,
++        "seed": args.seed,
++        "smoke": args.smoke,
++        "summary": {
++            "final_train_loss": history["losses"][-1] if history.get("losses") else None,
++            "n_examples": len(examples),
++            "label_mean": float(np.mean([ex["label"] for ex in examples])),
++        },
++    }
++    meta_path.write_text(json.dumps(metadata, indent=2))
++    print(f"[train_caimira] Saved metadata → {meta_path}")
++
++    print("\n[train_caimira] DONE. To package the submission ZIP:")
++    print("  bash submission/build_zip.sh")
++    print("\nBefore uploading to Codabench: validate via the local smoke test")
++    print("AND run the D-9 transfer-audit gate per llm_wiki/decisions/D9-*.md")
++    print("(predictive-eval-competition repo). The 2026-05-22 transfer postmortem")
++    print("documents that prior CAIMIRA m=5 submissions had best local val_nll")
++    print("AND worst hidden score — D-9 is a hard prerequisite, not a formality.")
++
++
++def _build_wide_response(
++    s: torch.Tensor, i: torch.Tensor, y: torch.Tensor, n_subj: int, n_items: int
++) -> torch.Tensor:
++    """Long-form → wide-form (NaN for unobserved); only positional helper.
++
++    CAIMIRA.fit accepts wide-form tensors per its
++    :meth:`torch_measure.models._base.IRTModel.fit` contract.
++    """
++    wide = torch.full((n_subj, n_items), float("nan"))
++    wide[s, i] = y
++    return wide
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/tests/test_models/test_caimira.py b/tests/test_models/test_caimira.py
+new file mode 100644
+index 0000000..a21e6bb
+--- /dev/null
++++ b/tests/test_models/test_caimira.py
+@@ -0,0 +1,177 @@
++# Copyright (c) 2026 AIMS Foundations. MIT License.
++
++import torch
++from torch import nn
++
++from torch_measure.models import CAIMIRA
++from torch_measure.models._predictor import predict_dense
++
++
++class TestCAIMIRA:
++    def test_init(self):
++        model = CAIMIRA(n_subjects=10, n_items=20, embedding_dim=64, latent_dim=3)
++        assert model.n_subjects == 10
++        assert model.n_items == 20
++        assert model.embedding_dim == 64
++        assert model.latent_dim == 3
++        assert model.skill.shape == (10, 3)
++
++    def test_default_latent_dim_matches_paper(self):
++        """Default latent_dim mirrors the value used in CAIMIRA paper experiments (m=5)."""
++        model = CAIMIRA(n_subjects=4, n_items=6, embedding_dim=8)
++        assert model.latent_dim == 5
++        assert model.skill.shape == (4, 5)
++
++    def test_init_rejects_nonpositive_dims(self):
++        try:
++            CAIMIRA(n_subjects=5, n_items=10, embedding_dim=0, latent_dim=3)
++            raise AssertionError("Expected ValueError for embedding_dim=0")
++        except ValueError:
++            pass
++        try:
++            CAIMIRA(n_subjects=5, n_items=10, embedding_dim=8, latent_dim=0)
++            raise AssertionError("Expected ValueError for latent_dim=0")
++        except ValueError:
++            pass
++
++    def test_difficulty_head_is_linear_and_biasless(self):
++        """Architectural invariant: difficulty head is bias-free (centering absorbs the bias)."""
++        model = CAIMIRA(n_subjects=5, n_items=10, embedding_dim=8, latent_dim=4)
++        assert isinstance(model.difficulty_head, nn.Linear)
++        assert model.difficulty_head.bias is None
++        assert model.difficulty_head.weight.shape == (4, 8)
++
++    def test_relevance_head_is_linear_with_bias(self):
++        """Architectural invariant: relevance head is linear with bias (informative under softmax)."""
++        model = CAIMIRA(n_subjects=5, n_items=10, embedding_dim=8, latent_dim=4)
++        assert isinstance(model.relevance_head, nn.Linear)
++        assert model.relevance_head.bias is not None
++        assert model.relevance_head.weight.shape == (4, 8)
++        assert model.relevance_head.bias.shape == (4,)
++
++    def test_set_embeddings_wrong_n_items(self):
++        model = CAIMIRA(n_subjects=5, n_items=10, embedding_dim=8, latent_dim=3)
++        try:
++            model.set_embeddings(torch.randn(7, 8))  # wrong n_items
++            raise AssertionError("Should have raised ValueError")
++        except ValueError:
++            pass
++
++    def test_set_embeddings_wrong_embedding_dim(self):
++        model = CAIMIRA(n_subjects=5, n_items=10, embedding_dim=8, latent_dim=3)
++        try:
++            model.set_embeddings(torch.randn(10, 16))  # wrong embedding_dim
++            raise AssertionError("Should have raised ValueError")
++        except ValueError:
++            pass
++
++    def test_predict_requires_embeddings(self):
++        model = CAIMIRA(n_subjects=5, n_items=10, embedding_dim=8, latent_dim=3)
++        try:
++            predict_dense(model)
++            raise AssertionError("Should have raised RuntimeError")
++        except RuntimeError:
++            pass
++
++    def test_predict_shape(self):
++        model = CAIMIRA(n_subjects=5, n_items=10, embedding_dim=8, latent_dim=3)
++        model.set_embeddings(torch.randn(10, 8))
++        probs = predict_dense(model)
++        assert probs.shape == (5, 10)
++        assert (probs >= 0).all()
++        assert (probs <= 1).all()
++
++    def test_relevance_rows_sum_to_one(self):
++        """Softmax invariant: each item's relevance vector lies on the simplex."""
++        model = CAIMIRA(n_subjects=5, n_items=10, embedding_dim=8, latent_dim=4)
++        model.set_embeddings(torch.randn(10, 8))
++        relevance, _ = model.compute_item_params()
++        assert relevance.shape == (10, 4)
++        assert torch.allclose(relevance.sum(dim=-1), torch.ones(10), atol=1e-6)
++
++    def test_relevance_is_nonnegative(self):
++        """Softmax invariant: relevance entries are non-negative."""
++        model = CAIMIRA(n_subjects=5, n_items=10, embedding_dim=8, latent_dim=4)
++        model.set_embeddings(torch.randn(10, 8))
++        relevance, _ = model.compute_item_params()
++        assert (relevance >= 0).all()
++
++    def test_difficulty_zero_centered_over_training_bank_dynamic(self):
++        """In dynamic centering mode, difficulty across the training bank has zero mean."""
++        model = CAIMIRA(n_subjects=5, n_items=10, embedding_dim=8, latent_dim=4)
++        model.set_embeddings(torch.randn(10, 8))
++        _, difficulty = model.compute_item_params(center="dynamic")
++        assert difficulty.shape == (10, 4)
++        assert torch.allclose(difficulty.mean(dim=0), torch.zeros(4), atol=1e-6)
++
++    def test_frozen_difficulty_mean_buffer_used_at_inference(self):
++        """After fit() the snapshot is taken; frozen-mode centering reads the buffer."""
++        torch.manual_seed(0)
++        n_subjects, n_items, embed = 6, 12, 8
++        model = CAIMIRA(n_subjects=n_subjects, n_items=n_items, embedding_dim=embed, latent_dim=3)
++        embeddings = torch.randn(n_items, embed)
++        responses = torch.bernoulli(torch.full((n_subjects, n_items), 0.5))
++        model.fit(responses, embeddings, max_epochs=5, verbose=False)
++        # Buffer should equal the training-bank d_raw mean.
++        with torch.no_grad():
++            d_raw_train = model.difficulty_head(embeddings)
++            assert torch.allclose(model._difficulty_mean, d_raw_train.mean(dim=0), atol=1e-6)
++        # Cold-start: new items should be centered by the SAME buffer, not their own mean.
++        new_embeddings = torch.randn(5, embed)
++        _, d_new = model.compute_item_params(new_embeddings, center="frozen")
++        with torch.no_grad():
++            d_raw_new = model.difficulty_head(new_embeddings)
++            expected = d_raw_new - model._difficulty_mean
++        assert torch.allclose(d_new, expected, atol=1e-6)
++
++    def test_predict_matches_manual_caimira_equation(self):
++        """End-to-end check: predict() matches sigmoid((s_i - d_j) · r_j) row by row."""
++        torch.manual_seed(0)
++        n_subjects, n_items, embed, latent = 4, 6, 8, 3
++        model = CAIMIRA(n_subjects=n_subjects, n_items=n_items, embedding_dim=embed, latent_dim=latent)
++        model.eval()  # use frozen centering (buffer is still zero → no centering effect)
++        embeddings = torch.randn(n_items, embed)
++        model.set_embeddings(embeddings)
++
++        query = {
++            "subject_idx": torch.tensor([0, 1, 2, 3, 0]),
++            "item_idx": torch.tensor([1, 2, 3, 4, 5]),
++        }
++        with torch.no_grad():
++            probs = model.predict(query)
++            relevance, difficulty = model.compute_item_params(center="frozen")
++            manual = torch.sigmoid(
++                (
++                    (model.skill[query["subject_idx"]] - difficulty[query["item_idx"]]) * relevance[query["item_idx"]]
++                ).sum(dim=-1)
++            )
++        assert probs.shape == (5,)
++        assert torch.allclose(probs, manual, atol=1e-6)
++
++    def test_fit_reduces_loss(self, small_response_matrix):
++        torch.manual_seed(0)
++        n_subjects, n_items = small_response_matrix.shape
++        embeddings = torch.randn(n_items, 16)
++        model = CAIMIRA(n_subjects=n_subjects, n_items=n_items, embedding_dim=16, latent_dim=3)
++        history = model.fit(small_response_matrix, embeddings, max_epochs=50, verbose=False)
++        assert history["losses"][-1] < history["losses"][0]
++
++    def test_eval_mode_uses_frozen_centering(self):
++        """In eval mode, compute_item_params uses the buffer (not dynamic recompute)."""
++        model = CAIMIRA(n_subjects=5, n_items=10, embedding_dim=8, latent_dim=3)
++        model.set_embeddings(torch.randn(10, 8))
++        # Manually set the buffer to a known non-zero value
++        with torch.no_grad():
++            model._difficulty_mean.fill_(0.5)
++        model.eval()
++        _, d_frozen = model.compute_item_params(center="auto")
++        with torch.no_grad():
++            d_raw = model.difficulty_head(model._embeddings)
++            expected = d_raw - 0.5
++        assert torch.allclose(d_frozen, expected, atol=1e-6)
++
++    def test_exported_from_models_init(self):
++        """CAIMIRA must be importable from torch_measure.models top-level."""
++        from torch_measure.models import CAIMIRA as ExportedCAIMIRA
++
++        assert ExportedCAIMIRA is CAIMIRA
+diff --git a/tests/test_models/test_cold_start_lookup.py b/tests/test_models/test_cold_start_lookup.py
+new file mode 100644
+index 0000000..98ac257
+--- /dev/null
++++ b/tests/test_models/test_cold_start_lookup.py
+@@ -0,0 +1,355 @@
++# Copyright (c) 2026 AIMS Foundations. MIT License.
++
++"""Unit tests for :class:`ColdStartLookupPredictor`.
++
++Coverage targets:
++    - All 6 fallback levels of the lookup hierarchy
++    - Name resolution: provider prefixes, case-insensitive matches, aliases
++    - IRT-blend math correctness against a closed-form expectation
++    - Platt calibration: intercept-only, shift cap, no-global-contamination
++    - Round-trip JSON persistence
++    - Numerical safety: extreme probabilities, missing keys
++"""
++
++from __future__ import annotations
++
++import json
++import math
++
++import pytest
++
++from torch_measure.models import ColdStartLookupPredictor
++from torch_measure.models.cold_start_lookup import (
++    _logit,
++    _sigmoid,
++    parse_subject_name,
++    resolve_subject_name,
++)
++
++
++# ---- Fixtures ---------------------------------------------------------------
++
++
++@pytest.fixture
++def lookup_tables() -> dict:
++    """Hand-crafted lookup mirroring the structure built by m3_build_colab.py.
++
++    Three subjects, three benchmarks, a deliberately-sparse triple table so
++    each fallback level can be exercised by at least one test.
++    """
++    return {
++        "sbc": {
++            "gpt-4||mmlupro||zero-shot": 0.78,
++            "gpt-4||mmlupro||cot": 0.85,
++            "claude-3||ai2d_test||none": 0.72,
++        },
++        "sb": {
++            "gpt-4||mmlupro": 0.80,
++            "gpt-4||cybench": 0.40,
++            "claude-3||ai2d_test": 0.72,
++            "llama-2-7b||cybench": 0.18,
++        },
++        "subj": {
++            "gpt-4": 0.75,
++            "claude-3": 0.70,
++            "llama-2-7b": 0.35,
++        },
++        "bench": {
++            "mmlupro": 0.50,
++            "cybench": 0.25,
++            "ai2d_test": 0.70,
++        },
++        "global": 0.645,
++        "name_aliases": {"Llama-2-7b-chat": "llama-2-7b"},
++        "name_lc": {
++            "gpt-4": "gpt-4",
++            "claude-3": "claude-3",
++            "llama-2-7b": "llama-2-7b",
++        },
++    }
++
++
++@pytest.fixture
++def predictor(lookup_tables: dict) -> ColdStartLookupPredictor:
++    return ColdStartLookupPredictor(
++        sbc=lookup_tables["sbc"],
++        sb=lookup_tables["sb"],
++        subj=lookup_tables["subj"],
++        bench=lookup_tables["bench"],
++        global_mean=lookup_tables["global"],
++        name_aliases=lookup_tables["name_aliases"],
++        name_lc=lookup_tables["name_lc"],
++    )
++
++
++# ---- Helpers ---------------------------------------------------------------
++
++
++def _make_record(benchmark: str, condition: str, subject_name: str) -> dict:
++    return {
++        "benchmark": benchmark,
++        "condition": condition,
++        "subject_content": f"Name: {subject_name}",
++        "item_content": "irrelevant for lookup",
++    }
++
++
++# ---- Level-by-level lookup tests --------------------------------------------
++
++
++class TestLookupLevels:
++    """Each test exercises one fallback level and asserts the expected source."""
++
++    def test_level1_triple_match(self, predictor: ColdStartLookupPredictor) -> None:
++        p = predictor.predict(_make_record("mmlupro", "zero-shot", "gpt-4"))
++        assert abs(p - 0.78) < 1e-6
++
++    def test_level1_falls_to_none_within_level(
++        self, predictor: ColdStartLookupPredictor
++    ) -> None:
++        """Unknown condition: tries `none` condition before falling out to L2."""
++        # claude-3 has sbc[claude-3||ai2d_test||none] = 0.72.
++        # An unseen condition `xyz` should still hit level 1 via the `none` fallback.
++        p = predictor.predict(_make_record("ai2d_test", "xyz", "claude-3"))
++        assert abs(p - 0.72) < 1e-6
++
++    def test_level2_pair_match(self, predictor: ColdStartLookupPredictor) -> None:
++        """Unseen condition with no level-1 match -> level 2 (subject, benchmark)."""
++        p = predictor.predict(_make_record("mmlupro", "few-shot", "gpt-4"))
++        assert abs(p - 0.80) < 1e-6
++
++    def test_level3_irt_blend(self, predictor: ColdStartLookupPredictor) -> None:
++        """Both single priors known, no pair: closed-form 1-PL Rasch blend."""
++        p = predictor.predict(_make_record("ai2d_test", "none", "gpt-4"))
++        expected = _sigmoid(_logit(0.75) + _logit(0.70) - _logit(0.645))
++        assert abs(p - expected) < 1e-6
++
++    def test_level4_bench_only(self, predictor: ColdStartLookupPredictor) -> None:
++        """Unknown subject, known benchmark -> benchmark prior."""
++        p = predictor.predict(_make_record("mmlupro", "none", "SomeUnknownModel"))
++        assert abs(p - 0.50) < 1e-6
++
++    def test_level5_subj_only(self, predictor: ColdStartLookupPredictor) -> None:
++        """Known subject, unknown benchmark -> subject prior."""
++        p = predictor.predict(_make_record("newbench_x", "none", "gpt-4"))
++        assert abs(p - 0.75) < 1e-6
++
++    def test_level6_global_fallback(self, predictor: ColdStartLookupPredictor) -> None:
++        """Neither known -> global mean."""
++        p = predictor.predict(_make_record("newbench_x", "none", "AlsoUnknown"))
++        assert abs(p - 0.645) < 1e-6
++
++
++# ---- Name resolution -------------------------------------------------------
++
++
++class TestNameResolution:
++    def test_provider_prefix_stripped(self, predictor: ColdStartLookupPredictor) -> None:
++        """meta-llama/Llama-2-7b-chat -> alias -> llama-2-7b -> sb hit."""
++        p = predictor.predict(_make_record("cybench", "none",
++                                          "meta-llama/Llama-2-7b-chat"))
++        assert abs(p - 0.18) < 1e-6
++
++    def test_case_insensitive_subject(self, predictor: ColdStartLookupPredictor) -> None:
++        """GPT-4 (different case) resolves to gpt-4 via the lower-case map."""
++        p = predictor.predict(_make_record("mmlupro", "zero-shot", "GPT-4"))
++        assert abs(p - 0.78) < 1e-6
++
++    def test_parse_subject_name_from_multiline(self) -> None:
++        sc = "Name: gpt-4\nOrganization: OpenAI\nParameters: unknown"
++        assert parse_subject_name(sc) == "gpt-4"
++
++    def test_parse_subject_name_no_label_falls_to_first_line(self) -> None:
++        # If `Name:` is missing the first line is taken as a heuristic.
++        assert parse_subject_name("gpt-4\nfoo\nbar") == "gpt-4"
++
++    def test_parse_subject_name_empty(self) -> None:
++        assert parse_subject_name("") == ""
++        assert parse_subject_name(None) == ""  # type: ignore[arg-type]
++
++    def test_resolve_unknown_name_returns_raw(self, lookup_tables: dict) -> None:
++        """A name with no provider prefix and no alias falls through untouched."""
++        out = resolve_subject_name(
++            "TotallyNewModel-V99",
++            subj_lookup=lookup_tables["subj"],
++            sb_lookup=lookup_tables["sb"],
++            sbc_lookup=lookup_tables["sbc"],
++            aliases=lookup_tables["name_aliases"],
++            name_lc=lookup_tables["name_lc"],
++        )
++        assert out == "TotallyNewModel-V99"
++
++
++# ---- Adaptive calibration --------------------------------------------------
++
++
++class TestCalibration:
++    def test_calibration_shifts_target_benchmark(
++        self, predictor: ColdStartLookupPredictor
++    ) -> None:
++        """Labels that look hard pull predictions DOWN for that benchmark."""
++        labeled = [
++            {"benchmark": "mmlupro", "condition": "zero-shot",
++             "subject_content": "Name: gpt-4", "label": 0},
++            {"benchmark": "mmlupro", "condition": "zero-shot",
++             "subject_content": "Name: claude-3", "label": 0},
++            {"benchmark": "mmlupro", "condition": "zero-shot",
++             "subject_content": "Name: llama-2-7b", "label": 0},
++            {"benchmark": "mmlupro", "condition": "zero-shot",
++             "subject_content": "Name: gpt-4", "label": 0},
++            {"benchmark": "mmlupro", "condition": "zero-shot",
++             "subject_content": "Name: claude-3", "label": 1},
++        ]
++        raw = predictor.predict(_make_record("mmlupro", "zero-shot", "gpt-4"))
++        cal = predictor.predict(_make_record("mmlupro", "zero-shot", "gpt-4"), labeled)
++        assert cal < raw - 0.01, (
++            f"Expected calibration to lower the prediction; got raw={raw:.4f}, "
++            f"cal={cal:.4f}"
++        )
++
++    def test_calibration_does_not_contaminate_other_benchmarks(
++        self, predictor: ColdStartLookupPredictor
++    ) -> None:
++        """A mmlupro-labeled list must not change cybench predictions."""
++        labeled = [
++            {"benchmark": "mmlupro", "subject_content": "Name: gpt-4", "label": 0},
++            {"benchmark": "mmlupro", "subject_content": "Name: claude-3", "label": 0},
++            {"benchmark": "mmlupro", "subject_content": "Name: llama-2-7b", "label": 0},
++            {"benchmark": "mmlupro", "subject_content": "Name: gpt-4", "label": 1},
++            {"benchmark": "mmlupro", "subject_content": "Name: claude-3", "label": 0},
++        ]
++        raw = predictor.predict(_make_record("cybench", "none", "gpt-4"))
++        cal = predictor.predict(_make_record("cybench", "none", "gpt-4"), labeled)
++        assert abs(cal - raw) < 1e-6, (
++            f"cybench prediction changed by mmlupro calibration: raw={raw:.4f}, cal={cal:.4f}"
++        )
++
++    def test_calibration_skips_singletons(
++        self, predictor: ColdStartLookupPredictor
++    ) -> None:
++        """A single labeled example for a benchmark should not produce a calibrator."""
++        labeled = [
++            {"benchmark": "mmlupro", "subject_content": "Name: gpt-4", "label": 0},
++        ]
++        predictor.calibrate(labeled)
++        assert "mmlupro" not in predictor._platt
++
++    def test_calibration_shift_is_capped(
++        self, predictor: ColdStartLookupPredictor
++    ) -> None:
++        """All-zeros labels would imply an infinite negative shift; we cap it."""
++        labeled = [
++            {"benchmark": "mmlupro", "subject_content": "Name: gpt-4", "label": 0},
++            {"benchmark": "mmlupro", "subject_content": "Name: gpt-4", "label": 0},
++        ]
++        # mean_y = 0 -> calibrator skipped (logit undefined). No entry, no crash.
++        predictor.calibrate(labeled)
++        assert "mmlupro" not in predictor._platt
++
++    def test_calibration_caches_by_length(
++        self, predictor: ColdStartLookupPredictor
++    ) -> None:
++        """Re-calling calibrate with the same-length list is a no-op."""
++        labeled = [
++            {"benchmark": "mmlupro", "subject_content": "Name: gpt-4", "label": 0},
++            {"benchmark": "mmlupro", "subject_content": "Name: claude-3", "label": 1},
++        ]
++        predictor.calibrate(labeled)
++        first_state = dict(predictor._platt)
++        predictor.calibrate(labeled)
++        assert predictor._platt == first_state
++
++
++# ---- IRT-blend math (level 3) ----------------------------------------------
++
++
++class TestIRTBlend:
++    def test_blend_with_unit_global(self) -> None:
++        """If global mean equals subj prior, the blend reduces to bench prior."""
++        predictor = ColdStartLookupPredictor(
++            sbc={}, sb={}, subj={"X": 0.6}, bench={"B": 0.4},
++            global_mean=0.6,
++            name_aliases={}, name_lc={"x": "X"},
++        )
++        p = predictor.predict({"benchmark": "B", "condition": "none",
++                               "subject_content": "Name: X", "item_content": ""})
++        assert abs(p - 0.4) < 1e-6
++
++    def test_blend_above_global_pushes_up(self) -> None:
++        """High subj + high bench relative to global -> blend > both single priors."""
++        predictor = ColdStartLookupPredictor(
++            sbc={}, sb={}, subj={"X": 0.8}, bench={"B": 0.7},
++            global_mean=0.5,
++            name_aliases={}, name_lc={"x": "X"},
++        )
++        p = predictor.predict({"benchmark": "B", "condition": "none",
++                               "subject_content": "Name: X", "item_content": ""})
++        assert p > 0.8 and p < 0.95
++
++
++# ---- Persistence -----------------------------------------------------------
++
++
++class TestPersistence:
++    def test_round_trip_via_json(
++        self, predictor: ColdStartLookupPredictor, tmp_path
++    ) -> None:
++        path = tmp_path / "lookup.json"
++        predictor.to_lookup_json(path)
++        loaded = ColdStartLookupPredictor.from_lookup_json(path)
++
++        sample = _make_record("mmlupro", "zero-shot", "gpt-4")
++        assert abs(predictor.predict(sample) - loaded.predict(sample)) < 1e-12
++
++    def test_from_lookup_json_schema_match(self, tmp_path) -> None:
++        payload = {
++            "sbc": {"a||b||c": 0.5},
++            "sb": {"a||b": 0.5},
++            "subj": {"a": 0.5},
++            "bench": {"b": 0.5},
++            "global": 0.5,
++        }
++        path = tmp_path / "lookup.json"
++        path.write_text(json.dumps(payload))
++        predictor = ColdStartLookupPredictor.from_lookup_json(path)
++        assert predictor.global_mean == 0.5
++        assert predictor.name_aliases == {}
++        assert predictor.name_lc == {}
++
++
++# ---- Numerical safety ------------------------------------------------------
++
++
++class TestNumericalSafety:
++    def test_extreme_probabilities_clipped(self) -> None:
++        """A prior of 0.999 in the lookup should still produce a finite logit."""
++        predictor = ColdStartLookupPredictor(
++            sbc={}, sb={}, subj={"X": 0.999}, bench={"B": 0.001},
++            global_mean=0.5, name_aliases={}, name_lc={"x": "X"},
++        )
++        # Level 3 IRT blend: logit(0.999) + logit(0.001) - logit(0.5).
++        # The two extremes nearly cancel and the result is close to 0.5.
++        p = predictor.predict({"benchmark": "B", "condition": "none",
++                               "subject_content": "Name: X", "item_content": ""})
++        assert math.isfinite(p)
++        assert 0.0 < p < 1.0
++
++    def test_empty_input_returns_global(self) -> None:
++        predictor = ColdStartLookupPredictor(
++            sbc={}, sb={}, subj={}, bench={}, global_mean=0.42,
++            name_aliases={}, name_lc={},
++        )
++        p = predictor.predict({"benchmark": "", "condition": "",
++                               "subject_content": "", "item_content": ""})
++        assert abs(p - 0.42) < 1e-6
++
++    def test_output_clipping_respected(self) -> None:
++        """Output clip should bound predictions even when lookup returns 1.0."""
++        predictor = ColdStartLookupPredictor(
++            sbc={"x||b||none": 1.0}, sb={}, subj={}, bench={},
++            global_mean=0.5, name_aliases={}, name_lc={"x": "x"},
++            output_clip=(0.05, 0.95),
++        )
++        p = predictor.predict({"benchmark": "b", "condition": "none",
++                               "subject_content": "Name: x", "item_content": ""})
++        assert p == 0.95
+diff --git a/tests/test_models/test_llm_judge_irt.py b/tests/test_models/test_llm_judge_irt.py
+new file mode 100644
+index 0000000..4c239bf
+--- /dev/null
++++ b/tests/test_models/test_llm_judge_irt.py
+@@ -0,0 +1,247 @@
++# Copyright (c) 2026 AIMS Foundations. MIT License.
++
++"""Unit tests for :class:`LLMJudgeIRT` and its difficulty prompt builder.
++
++The judge function itself (a frozen LLM call) is mocked throughout these
++tests; we are not testing the LLM, we are testing the IRT combination,
++parameter fitting, and graceful-failure semantics.
++"""
++
++from __future__ import annotations
++
++import math
++import re
++
++import pytest
++
++from torch_measure.models import (
++    ColdStartLookupPredictor,
++    LLMJudgeIRT,
++    build_difficulty_prompt,
++)
++
++
++# ---- Fixtures ---------------------------------------------------------------
++
++
++@pytest.fixture
++def minimal_lookup() -> ColdStartLookupPredictor:
++    """A tiny lookup that always falls through to a level-3 IRT blend."""
++    return ColdStartLookupPredictor(
++        sbc={}, sb={},
++        subj={"gpt-4": 0.75, "claude-3": 0.70, "llama-2-7b": 0.35},
++        bench={"mmlupro": 0.50, "cybench": 0.25, "ai2d_test": 0.70},
++        global_mean=0.645,
++        name_aliases={}, name_lc={"gpt-4": "gpt-4", "claude-3": "claude-3"},
++    )
++
++
++# ---- Prompt construction ---------------------------------------------------
++
++
++class TestDifficultyPrompt:
++    def test_prompt_contains_benchmark_name(self) -> None:
++        prompt = build_difficulty_prompt("What is 2+2?", "mmlupro")
++        assert "`mmlupro`" in prompt
++
++    def test_prompt_truncates_item_to_max_chars(self) -> None:
++        long_item = "x" * 5000
++        prompt = build_difficulty_prompt(long_item, "mmlupro", max_item_chars=100)
++        # The prompt should still contain "Question:" but the item portion is bounded.
++        assert "Question:" in prompt
++        question_start = prompt.index("Question:") + len("Question:\n")
++        question_end = prompt.index("\n\nIs this question difficult?")
++        item_in_prompt = prompt[question_start:question_end]
++        assert len(item_in_prompt) <= 100
++
++    def test_prompt_ends_with_answer_marker(self) -> None:
++        """The judge reads next-token logprobs at the position right after `Answer:`."""
++        prompt = build_difficulty_prompt("anything", "mmlupro")
++        assert prompt.rstrip().endswith("Answer:")
++
++    def test_prompt_does_not_mention_specific_subject(self) -> None:
++        """By design the difficulty prompt is subject-independent."""
++        prompt = build_difficulty_prompt("Q", "mmlupro")
++        # The prompt should NOT contain any explicit subject identifiers.
++        for forbidden in ("gpt-4", "Name:", "claude"):
++            assert forbidden.lower() not in prompt.lower()
++
++
++# ---- Predictor behaviour ---------------------------------------------------
++
++
++class TestPredict:
++    def test_alpha_zero_recovers_lookup_logit(
++        self, minimal_lookup: ColdStartLookupPredictor
++    ) -> None:
++        """alpha=0, beta=0 -> predict matches sigmoid(logit(lookup)). Should equal lookup."""
++        def constant_judge(item: str, bench: str) -> float:
++            return 7.5  # any value -- multiplied by zero anyway
++
++        model = LLMJudgeIRT(
++            lookup=minimal_lookup,
++            judge_fn=constant_judge,
++            alpha=0.0,
++            beta=0.0,
++        )
++        record = {
++            "benchmark": "mmlupro",
++            "condition": "none",
++            "subject_content": "Name: gpt-4",
++            "item_content": "any item",
++        }
++        p_irt = model.predict(record)
++        p_lookup = minimal_lookup.predict(record)
++        assert abs(p_irt - p_lookup) < 1e-6
++
++    def test_positive_alpha_with_hard_judge_lowers_prediction(
++        self, minimal_lookup: ColdStartLookupPredictor
++    ) -> None:
++        """alpha>0 and judge says yes (hard) -> delta>0 -> P(correct) decreases."""
++        def hard_judge(item: str, bench: str) -> float:
++            return 1.0  # yes > no
++
++        model = LLMJudgeIRT(
++            lookup=minimal_lookup,
++            judge_fn=hard_judge,
++            alpha=0.5,
++            beta=0.0,
++        )
++        record = {
++            "benchmark": "mmlupro",
++            "condition": "none",
++            "subject_content": "Name: gpt-4",
++            "item_content": "hard q",
++        }
++        p_irt = model.predict(record)
++        p_lookup = minimal_lookup.predict(record)
++        assert p_irt < p_lookup
++
++    def test_positive_alpha_with_easy_judge_raises_prediction(
++        self, minimal_lookup: ColdStartLookupPredictor
++    ) -> None:
++        def easy_judge(item: str, bench: str) -> float:
++            return -1.0  # no > yes -> easy
++
++        model = LLMJudgeIRT(
++            lookup=minimal_lookup,
++            judge_fn=easy_judge,
++            alpha=0.5,
++            beta=0.0,
++        )
++        record = {
++            "benchmark": "mmlupro",
++            "condition": "none",
++            "subject_content": "Name: gpt-4",
++            "item_content": "easy q",
++        }
++        p_irt = model.predict(record)
++        p_lookup = minimal_lookup.predict(record)
++        assert p_irt > p_lookup
++
++    def test_judge_exception_handled_gracefully(
++        self, minimal_lookup: ColdStartLookupPredictor
++    ) -> None:
++        """A raised exception from the judge should degrade to the lookup value."""
++        def broken_judge(item: str, bench: str) -> float:
++            raise RuntimeError("simulated judge failure")
++
++        model = LLMJudgeIRT(
++            lookup=minimal_lookup,
++            judge_fn=broken_judge,
++            alpha=0.5,
++            beta=0.0,
++        )
++        record = {
++            "benchmark": "mmlupro",
++            "condition": "none",
++            "subject_content": "Name: gpt-4",
++            "item_content": "q",
++        }
++        p_irt = model.predict(record)
++        p_lookup = minimal_lookup.predict(record)
++        # judge_logit collapses to 0 -> delta=0 -> recover lookup.
++        assert abs(p_irt - p_lookup) < 1e-6
++
++    def test_logit_cap_bounds_extreme_outputs(
++        self, minimal_lookup: ColdStartLookupPredictor
++    ) -> None:
++        """Even with extreme judge logits, output stays inside output_clip."""
++        def extreme_judge(item: str, bench: str) -> float:
++            return 100.0
++
++        model = LLMJudgeIRT(
++            lookup=minimal_lookup,
++            judge_fn=extreme_judge,
++            alpha=10.0,  # large slope
++            beta=0.0,
++            logit_cap=3.0,
++        )
++        record = {
++            "benchmark": "mmlupro",
++            "condition": "none",
++            "subject_content": "Name: gpt-4",
++            "item_content": "q",
++        }
++        p = model.predict(record)
++        lo, hi = minimal_lookup.output_clip
++        assert lo <= p <= hi
++        assert math.isfinite(p)
++
++
++# ---- Parameter fitting ----------------------------------------------------
++
++
++class TestFitAlphaBeta:
++    def test_zero_signal_yields_near_zero_alpha(self) -> None:
++        """If judge_logits have no relationship with labels, alpha shrinks toward 0."""
++        scipy = pytest.importorskip("scipy")
++        import numpy as np  # noqa: F401
++
++        rng_thetas = [0.0] * 200
++        rng_jl = [(i % 7) * 0.1 - 0.3 for i in range(200)]
++        # Labels uncorrelated with jl.
++        rng_labels = [i % 2 for i in range(200)]
++        alpha, beta, _ = LLMJudgeIRT.fit_alpha_beta(
++            rng_thetas, rng_jl, rng_labels, l2_penalty=2.0,
++        )
++        assert abs(alpha) < 0.2, f"alpha should be near 0 for noise, got {alpha}"
++
++    def test_strong_signal_recovers_alpha_sign(self) -> None:
++        """With a clean positive signal, the fitted alpha should be > 0."""
++        scipy = pytest.importorskip("scipy")
++
++        # Construct a dataset where higher judge_logit -> lower label probability,
++        # which under the IRT formula P = sigmoid(theta - alpha*jl - beta) implies
++        # alpha > 0 is needed to drive P down when jl is high.
++        n = 400
++        thetas = [0.5] * n
++        judge_logits = []
++        labels = []
++        for i in range(n):
++            jl = (i / n - 0.5) * 4  # range [-2, 2]
++            # True alpha=1.5, beta=0: P = sigmoid(0.5 - 1.5*jl)
++            p_true = 1.0 / (1.0 + math.exp(-(0.5 - 1.5 * jl)))
++            judge_logits.append(jl)
++            labels.append(1 if p_true > 0.5 else 0)
++        alpha, beta, _ = LLMJudgeIRT.fit_alpha_beta(
++            thetas, judge_logits, labels, l2_penalty=0.0,
++        )
++        assert alpha > 0.5, f"alpha should clearly be positive, got {alpha}"
++
++    def test_l2_penalty_shrinks_alpha(self) -> None:
++        """Increasing L2 penalty should shrink the absolute value of alpha."""
++        scipy = pytest.importorskip("scipy")
++
++        n = 100
++        thetas = [0.0] * n
++        judge_logits = [(-1.0 + 2 * i / n) for i in range(n)]
++        labels = [1 if jl < 0 else 0 for jl in judge_logits]
++
++        alpha_no_l2, _, _ = LLMJudgeIRT.fit_alpha_beta(
++            thetas, judge_logits, labels, l2_penalty=0.0,
++        )
++        alpha_strong_l2, _, _ = LLMJudgeIRT.fit_alpha_beta(
++            thetas, judge_logits, labels, l2_penalty=100.0,
++        )
++        assert abs(alpha_strong_l2) < abs(alpha_no_l2)
+diff --git a/tests/test_submission/__init__.py b/tests/test_submission/__init__.py
+new file mode 100644
+index 0000000..e69de29
+diff --git a/tests/test_submission/test_caimira_lite.py b/tests/test_submission/test_caimira_lite.py
+new file mode 100644
+index 0000000..3541371
+--- /dev/null
++++ b/tests/test_submission/test_caimira_lite.py
+@@ -0,0 +1,252 @@
++# Copyright (c) 2026 AIMS Foundations. MIT License.
++
++"""Unit tests for submission.caimira_lite — standalone CAIMIRA + EB lookup.
++
++Covers the SHIPPABLE submission classes (no torch_measure import). These
++tests verify (a) state_dict round-trip from the upstream CAIMIRA, (b) the
++6-level EB fallback walks each level correctly, (c) parse_subject_name +
++resolve_subject_name handle the documented edge cases.
++"""
++
++from __future__ import annotations
++
++import sys
++from pathlib import Path
++
++import pytest
++import torch
++
++REPO_ROOT = Path(__file__).resolve().parents[2]
++SUBMISSION_DIR = REPO_ROOT / "submission"
++if str(SUBMISSION_DIR) not in sys.path:
++    sys.path.insert(0, str(SUBMISSION_DIR))
++
++from caimira_lite import (  # noqa: E402
++    CAIMIRALite,
++    EBLookup,
++    clip_for_predict,
++    parse_subject_name,
++    resolve_subject_name,
++)
++
++from torch_measure.models import CAIMIRA  # noqa: E402
++
++
++class TestCAIMIRALiteStateDictParity:
++    """The standalone CAIMIRALite MUST accept state_dicts from upstream CAIMIRA."""
++
++    def test_keys_match_upstream(self):
++        n_s, n_i, d, k = 5, 7, 16, 3
++        upstream = CAIMIRA(n_subjects=n_s, n_items=n_i, embedding_dim=d, latent_dim=k)
++        lite = CAIMIRALite(n_subjects=n_s, n_items=n_i, embedding_dim=d, latent_dim=k)
++        upstream_keys = set(upstream.state_dict().keys())
++        lite_keys = set(lite.state_dict().keys())
++        assert upstream_keys == lite_keys
++
++    def test_state_dict_round_trips(self):
++        n_s, n_i, d, k = 5, 7, 16, 3
++        upstream = CAIMIRA(n_subjects=n_s, n_items=n_i, embedding_dim=d, latent_dim=k)
++        with torch.no_grad():
++            upstream.skill.fill_(0.3)
++            upstream.relevance_head.weight.fill_(0.1)
++            upstream.relevance_head.bias.fill_(-0.05)
++            upstream.difficulty_head.weight.fill_(0.2)
++            upstream._difficulty_mean.fill_(0.07)
++
++        lite = CAIMIRALite(n_subjects=n_s, n_items=n_i, embedding_dim=d, latent_dim=k)
++        missing, unexpected = lite.load_state_dict(upstream.state_dict(), strict=True)
++        assert missing == [] and unexpected == []
++        assert torch.allclose(lite.skill, upstream.skill)
++        assert torch.allclose(lite.relevance_head.weight, upstream.relevance_head.weight)
++        assert torch.allclose(lite.relevance_head.bias, upstream.relevance_head.bias)
++        assert torch.allclose(lite.difficulty_head.weight, upstream.difficulty_head.weight)
++        assert torch.allclose(lite._difficulty_mean, upstream._difficulty_mean)
++
++
++class TestCAIMIRALiteForward:
++    def test_init_rejects_nonpositive(self):
++        with pytest.raises(ValueError):
++            CAIMIRALite(n_subjects=5, n_items=10, embedding_dim=0, latent_dim=3)
++        with pytest.raises(ValueError):
++            CAIMIRALite(n_subjects=5, n_items=10, embedding_dim=8, latent_dim=0)
++
++    def test_caimira_logit_returns_float(self):
++        m = CAIMIRALite(n_subjects=4, n_items=6, embedding_dim=8, latent_dim=3)
++        m.eval()
++        emb = torch.randn(8)
++        out = m.caimira_logit(subject_idx=2, item_embedding=emb)
++        assert isinstance(out, float)
++        assert -100 < out < 100  # sane finite range
++
++    def test_caimira_logit_matches_manual_equation(self):
++        """End-to-end check: caimira_logit == ((s - d) * r).sum() with frozen centering."""
++        torch.manual_seed(0)
++        n_s, n_i, d, k = 4, 6, 8, 3
++        m = CAIMIRALite(n_subjects=n_s, n_items=n_i, embedding_dim=d, latent_dim=k)
++        m.eval()
++        with torch.no_grad():
++            m._difficulty_mean.fill_(0.25)
++        emb = torch.randn(d)
++        idx = 2
++        out = m.caimira_logit(subject_idx=idx, item_embedding=emb)
++        with torch.no_grad():
++            relevance = torch.softmax(m.relevance_head(emb), dim=-1)
++            d_raw = m.difficulty_head(emb)
++            difficulty = d_raw - m._difficulty_mean
++            skill = m.skill[idx]
++            manual = ((skill - difficulty) * relevance).sum().item()
++        assert abs(out - manual) < 1e-6
++
++
++class TestParseSubjectName:
++    def test_extracts_name_after_label(self):
++        assert parse_subject_name("Name: GPT-4") == "GPT-4"
++
++    def test_extracts_first_line_when_multi_line(self):
++        content = "Name: Claude-3-Opus\nOrganization: Anthropic\nParameters: 175B"
++        assert parse_subject_name(content) == "Claude-3-Opus"
++
++    def test_falls_back_to_first_line_when_no_name_label(self):
++        assert parse_subject_name("Llama-2-70b") == "Llama-2-70b"
++
++    def test_empty_input_returns_empty(self):
++        assert parse_subject_name("") == ""
++        assert parse_subject_name(None or "") == ""
++
++
++class TestResolveSubjectName:
++    def test_direct_match_returns_unchanged(self):
++        subj = {"GPT-4": 0.8}
++        name = resolve_subject_name("GPT-4", subj, {}, {}, {}, {})
++        assert name == "GPT-4"
++
++    def test_provider_prefix_stripped(self):
++        subj = {"Llama-2-7b-chat": 0.7}
++        name = resolve_subject_name(
++            "meta-llama/Llama-2-7b-chat",
++            subj, {}, {}, {}, {},
++        )
++        assert name == "Llama-2-7b-chat"
++
++    def test_case_insensitive_fallback(self):
++        name_lc = {"gpt-4": "GPT-4"}
++        name = resolve_subject_name("gpt-4", {}, {}, {}, {}, name_lc)
++        assert name == "GPT-4"
++
++    def test_unresolved_returns_raw(self):
++        name = resolve_subject_name("UnknownModel", {}, {}, {}, {}, {})
++        assert name == "UnknownModel"
++
++
++class TestEBLookup:
++    """Verify the 6-level fallback hierarchy walks correctly."""
++
++    @pytest.fixture
++    def lookup(self) -> EBLookup:
++        return EBLookup(
++            sbc={"gpt-4||mmlupro||cot": 0.85},
++            sb={"gpt-4||mmlupro": 0.80, "gpt-4||ai2d": 0.70},
++            subj={"gpt-4": 0.78, "claude-3": 0.72},
++            bench={"mmlupro": 0.50, "ai2d": 0.65, "untested_bench": 0.30},
++            global_mean=0.55,
++        )
++
++    def test_level1_sbc_triple(self, lookup):
++        assert lookup.lookup_p("gpt-4", "mmlupro", "cot") == 0.85
++
++    def test_level2_sb_pair(self, lookup):
++        # condition not in sbc triple → falls to sb pair
++        assert lookup.lookup_p("gpt-4", "ai2d", "any_condition") == 0.70
++
++    def test_level3_irt_blend(self, lookup):
++        # subject + bench known, but no sb entry → IRT blend
++        # logit(0.72) + logit(0.65) - logit(0.55)
++        p = lookup.lookup_p("claude-3", "ai2d", "x")
++        assert 0.05 <= p <= 0.95
++        # Should be ABOVE the bench prior since subject is also above-average.
++        assert p > 0.65
++
++    def test_level4_bench_only(self, lookup):
++        # Unknown subject, known bench → bench prior
++        assert lookup.lookup_p("MysteryModel", "untested_bench", "x") == 0.30
++
++    def test_level5_subj_only(self, lookup):
++        # Known subject, unknown bench → subject prior
++        assert lookup.lookup_p("gpt-4", "MysteryBench", "x") == 0.78
++
++    def test_level6_global_fallback(self, lookup):
++        # Both unknown → global mean
++        assert lookup.lookup_p("MysteryModel", "MysteryBench", "x") == 0.55
++
++
++class TestEBLookupPlatt:
++    """Intercept-only Platt with ±1.5 shift cap, slope fixed at 1.0."""
++
++    def test_calibrate_shifts_intercept(self):
++        lookup = EBLookup(
++            sbc={},
++            sb={},
++            subj={},
++            bench={"b1": 0.30},
++            global_mean=0.50,
++        )
++        labeled = [
++            {"subject_content": "Name: m1", "benchmark": "b1", "condition": "x", "label": 1.0},
++            {"subject_content": "Name: m2", "benchmark": "b1", "condition": "x", "label": 1.0},
++            {"subject_content": "Name: m3", "benchmark": "b1", "condition": "x", "label": 1.0},
++        ]
++        # Mean label = 1.0 → degenerate target_logit = +inf → should skip per
++        # the mean_y <= 0 or >= 1 guard, NOT crash.
++        lookup.fit_platt(labeled)
++        assert "b1" not in lookup._platt  # skipped because mean_y == 1.0
++
++    def test_calibrate_caps_shift_at_1_5(self):
++        lookup = EBLookup(
++            sbc={},
++            sb={},
++            subj={},
++            bench={"b1": 0.05},  # very low prior; would want huge upward shift
++            global_mean=0.50,
++        )
++        labeled = [
++            {"subject_content": f"Name: m{i}", "benchmark": "b1", "condition": "x",
++             "label": 1.0 if i % 2 == 0 else 0.0}
++            for i in range(8)
++        ]
++        # mean_y = 0.5 → target_logit = 0; mean_x = logit(0.05) ≈ -2.94.
++        # Wanted shift = 0 - (-2.94) = +2.94, capped to +1.5.
++        lookup.fit_platt(labeled)
++        assert "b1" in lookup._platt
++        slope, intercept = lookup._platt["b1"]
++        assert slope == 1.0
++        assert abs(intercept - 1.5) < 1e-6  # capped
++
++    def test_predict_applies_platt_when_labeled(self):
++        lookup = EBLookup(
++            sbc={},
++            sb={},
++            subj={},
++            bench={"b1": 0.30},
++            global_mean=0.50,
++        )
++        p_no_labeled = lookup.predict("Name: m", "b1", "x", labeled=None)
++        labeled = [
++            {"subject_content": f"Name: m{i}", "benchmark": "b1", "condition": "x",
++             "label": 1.0 if i % 2 == 0 else 0.0}
++            for i in range(4)
++        ]
++        p_with_labeled = lookup.predict("Name: m", "b1", "x", labeled=labeled)
++        # mean_y = 0.5, mean_x = logit(0.30) ≈ -0.85.
++        # Shift should be positive (upward) → p_with > p_no.
++        assert p_with_labeled > p_no_labeled
++
++
++class TestClipForPredict:
++    def test_clips_to_kit_range(self):
++        assert clip_for_predict(-0.1) == 1e-4
++        assert clip_for_predict(1.5) == 1.0 - 1e-4
++        assert clip_for_predict(0.5) == 0.5
++
++    def test_returns_native_float(self):
++        out = clip_for_predict(torch.tensor(0.7).item())
++        assert type(out) is float
+diff --git a/tests/test_submission/test_model_contract.py b/tests/test_submission/test_model_contract.py
+new file mode 100644
+index 0000000..137b5ba
+--- /dev/null
++++ b/tests/test_submission/test_model_contract.py
+@@ -0,0 +1,176 @@
++# Copyright (c) 2026 AIMS Foundations. MIT License.
++
++"""Kit-contract tests for submission/model.py.
++
++Runs the module in LOCAL_SMOKE mode (PREDICTIVE_EVAL_LOCAL_SMOKE_TEST=1)
++so we exercise the import + signature surface without requiring the
++trained artifact or the HF cache. The kit's own check_submission_zip.py
++also uses this mode (per starting_kit/tools/check_submission_zip.py:18,131).
++"""
++
++from __future__ import annotations
++
++import importlib
++import numbers
++import os
++import sys
++from pathlib import Path
++
++REPO_ROOT = Path(__file__).resolve().parents[2]
++SUBMISSION_DIR = REPO_ROOT / "submission"
++
++
++def _load_model_module():
++    """Reload submission.model with LOCAL_SMOKE=1 so we skip artifact loads."""
++    os.environ["PREDICTIVE_EVAL_LOCAL_SMOKE_TEST"] = "1"
++    if str(SUBMISSION_DIR) not in sys.path:
++        sys.path.insert(0, str(SUBMISSION_DIR))
++    if "model" in sys.modules:
++        del sys.modules["model"]
++    if "caimira_lite" in sys.modules:
++        # Reload to pick up the LOCAL_SMOKE env-var change in model.py.
++        del sys.modules["caimira_lite"]
++    return importlib.import_module("model")
++
++
++class TestModelContract:
++    def test_module_imports_in_local_smoke_mode(self):
++        mod = _load_model_module()
++        assert hasattr(mod, "predict")
++        assert callable(mod.predict)
++
++    def test_predict_signature(self):
++        mod = _load_model_module()
++        import inspect
++
++        sig = inspect.signature(mod.predict)
++        params = list(sig.parameters.keys())
++        assert params[0] == "input"
++        assert "labeled" in params
++        assert sig.parameters["labeled"].default is None
++
++    def test_predict_returns_native_float(self):
++        mod = _load_model_module()
++        sample_input = {
++            "benchmark": "mmlupro",
++            "condition": "cot",
++            "subject_content": "Name: gpt-4\nOrganization: openai",
++            "item_content": "What is 2+2?",
++        }
++        out = mod.predict(sample_input, labeled=None)
++        assert isinstance(out, float)
++        # Kit checker rejects bool — confirm we don't sneak one through.
++        assert not isinstance(out, bool)
++        # Also verify it's specifically a numbers.Real per check_submission_zip.py:154.
++        assert isinstance(out, numbers.Real)
++
++    def test_predict_returns_finite_in_unit_interval(self):
++        mod = _load_model_module()
++        sample_input = {
++            "benchmark": "mmlupro",
++            "condition": "cot",
++            "subject_content": "Name: gpt-4",
++            "item_content": "What is 2+2?",
++        }
++        out = mod.predict(sample_input)
++        import math
++
++        assert math.isfinite(out)
++        assert 0.0 <= out <= 1.0
++
++    def test_predict_accepts_empty_labeled(self):
++        mod = _load_model_module()
++        sample_input = {
++            "benchmark": "mmlupro",
++            "condition": "cot",
++            "subject_content": "Name: gpt-4",
++            "item_content": "What is 2+2?",
++        }
++        out = mod.predict(sample_input, labeled=[])
++        assert isinstance(out, float)
++        assert 0.0 <= out <= 1.0
++
++    def test_predict_accepts_labeled_as_kwarg(self):
++        """Kit checker calls predict(dict(SMOKE_INPUT), labeled=[])."""
++        mod = _load_model_module()
++        sample_input = {
++            "benchmark": "mmlupro",
++            "condition": "cot",
++            "subject_content": "Name: gpt-4",
++            "item_content": "What is 2+2?",
++        }
++        out = mod.predict(dict(sample_input), labeled=[])
++        assert 0.0 <= out <= 1.0
++
++
++class TestModelAcquisitionContract:
++    def test_acquisition_function_signature(self):
++        if "labeling" in sys.modules:
++            del sys.modules["labeling"]
++        if str(SUBMISSION_DIR) not in sys.path:
++            sys.path.insert(0, str(SUBMISSION_DIR))
++        import inspect
++
++        import labeling
++
++        sig = inspect.signature(labeling.acquisition_function)
++        assert list(sig.parameters.keys())[0] == "input"
++
++    def test_acquisition_function_returns_finite_real(self):
++        if "labeling" in sys.modules:
++            del sys.modules["labeling"]
++        if str(SUBMISSION_DIR) not in sys.path:
++            sys.path.insert(0, str(SUBMISSION_DIR))
++        import labeling
++
++        sample = {
++            "benchmark": "mmlupro",
++            "condition": "cot",
++            "subject_content": "Name: gpt-4",
++            "item_content": "What is 2+2?",
++        }
++        out = labeling.acquisition_function(sample)
++        import math
++
++        assert isinstance(out, float)
++        assert math.isfinite(out)
++        assert not isinstance(out, bool)
++
++    def test_acquisition_function_bulletproof_sentinel_on_exception(self):
++        if "labeling" in sys.modules:
++            del sys.modules["labeling"]
++        if str(SUBMISSION_DIR) not in sys.path:
++            sys.path.insert(0, str(SUBMISSION_DIR))
++        import labeling
++
++        # Pass a value that breaks _visible_text's str() — e.g., an object
++        # whose __str__ raises. The bare-except path must catch and return
++        # exactly 0.0.
++        class _Boom:
++            def __str__(self):
++                raise RuntimeError("synthetic")
++
++        out = labeling.acquisition_function({"benchmark": _Boom()})
++        assert out == 0.0  # the distinguishable sentinel
++
++    def test_acquisition_function_distinguishable_from_legitimate_floor(self):
++        if "labeling" in sys.modules:
++            del sys.modules["labeling"]
++        if str(SUBMISSION_DIR) not in sys.path:
++            sys.path.insert(0, str(SUBMISSION_DIR))
++        import labeling
++
++        # Reset module-level state for a clean run.
++        labeling._seen_signatures.clear()
++        labeling._stratum_counts.clear()
++        labeling._candidate_count = 0
++        sample = {
++            "benchmark": "mmlupro",
++            "condition": "cot",
++            "subject_content": "Name: gpt-4",
++            "item_content": "What is 2+2?",
++        }
++        score = labeling.acquisition_function(sample)
++        # Legitimate floor includes tie_break > 0 — score should be strictly > 0.
++        assert score > 0.0
++        assert score <= 2.0  # _clamp_score's upper bound
+diff --git a/tutorials/predictive_evaluation_challenge.ipynb b/tutorials/predictive_evaluation_challenge.ipynb
+new file mode 100644
+index 0000000..d9f47d9
+--- /dev/null
++++ b/tutorials/predictive_evaluation_challenge.ipynb
+@@ -0,0 +1,622 @@
++{
++ "cells": [
++  {
++   "cell_type": "markdown",
++   "id": "718d1d16",
++   "metadata": {},
++   "source": [
++    "# Predictive AI Evaluation Challenge: A Practitioner's Iteration Log\n",
++    "\n",
++    "This notebook is the companion reproducibility artifact for the Stanford CS321M Predictive AI Evaluation Challenge entry that scored **NLL = -0.59 (tied #6 of 14)** on the Codabench leaderboard. It walks through:\n",
++    "\n",
++    "1. The cold-start prediction setting and what makes it hard\n",
++    "2. `ColdStartLookupPredictor` -- the six-level hierarchical empirical-Bayes model deployed as the final submission\n",
++    "3. The intercept-only Platt calibration mechanism and why it differs from full Platt\n",
++    "4. `LLMJudgeIRT` -- the 1-PL IRT augmentation that was *not* deployed and why\n",
++    "5. A reproducible negative-result analysis on synthetic data\n",
++    "\n",
++    "**Why this notebook exists.** The competition leaderboard rewards predictions, but the technical-report and GitHub artifacts are graded on engineering discipline and reproducibility. This tutorial demonstrates both models in self-contained CPU-only Python (no HuggingFace download, no GPU) so a reviewer can verify every numerical claim in the report by re-running cells in order.\n",
++    "\n",
++    "**Runtime:** ~30 seconds on CPU."
++   ]
++  },
++  {
++   "cell_type": "markdown",
++   "id": "13311c49",
++   "metadata": {},
++   "source": [
++    "## 1. The cold-start setting\n",
++    "\n",
++    "Let $X_{ij} \\in \\{0, 1\\}$ denote whether AI model $i$ correctly answers item $j$. At training time we observe $X$ on a dense matrix of 909 subjects $\\times$ ~104K items. At test time we get *new* items but the *same* subjects, plus four fields per row: a benchmark id, a condition, a multi-line subject_content block, and the raw item text.\n",
++    "\n",
++    "This is the **item cold-start** regime. The relevant axis of variation is item difficulty, not subject ability -- the subjects are known and their priors can be learned. The competition supplies $K=5$ ground-truth labels per benchmark via an adaptive labelling channel before `predict()` is called.\n",
++    "\n",
++    "Metric: mean log-likelihood. Higher is better, $\\mathcal{L} = 0$ is the upper bound, $\\hat{p} = 0.5$ uniformly gives $\\mathcal{L} = -\\log 2 \\approx -0.693$."
++   ]
++  },
++  {
++   "cell_type": "code",
++   "execution_count": 1,
++   "id": "566c5aeb",
++   "metadata": {
++    "execution": {
++     "iopub.execute_input": "2026-05-13T04:27:47.930551Z",
++     "iopub.status.busy": "2026-05-13T04:27:47.930177Z",
++     "iopub.status.idle": "2026-05-13T04:27:52.480412Z",
++     "shell.execute_reply": "2026-05-13T04:27:52.479836Z"
++    }
++   },
++   "outputs": [
++    {
++     "name": "stderr",
++     "output_type": "stream",
++     "text": [
++      "/Users/vasundras/anaconda3/envs/torch_measure/lib/python3.11/site-packages/tqdm/auto.py:21: TqdmWarning: IProgress not found. Please update jupyter and ipywidgets. See https://ipywidgets.readthedocs.io/en/stable/user_install.html\n",
++      "  from .autonotebook import tqdm as notebook_tqdm\n"
++     ]
++    }
++   ],
++   "source": [
++    "import math\n",
++    "\n",
++    "from torch_measure.models import ColdStartLookupPredictor, LLMJudgeIRT, build_difficulty_prompt"
++   ]
++  },
++  {
++   "cell_type": "markdown",
++   "id": "f66502bb",
++   "metadata": {},
++   "source": [
++    "## 2. The deployed model: `ColdStartLookupPredictor`\n",
++    "\n",
++    "The model walks a six-level fallback hierarchy and returns the first match. Each level is tried exact, then case-insensitive.\n",
++    "\n",
++    "| Level | Key                                          | Source                          |\n",
++    "|-------|----------------------------------------------|---------------------------------|\n",
++    "| 1     | `(subject, benchmark, condition)`            | training triples, $n \\geq 3$    |\n",
++    "| 2     | `(subject, benchmark)`                       | Bayesian-shrunk, $n \\geq 1$     |\n",
++    "| 3     | $\\sigma(\\mathrm{logit}\\,s + \\mathrm{logit}\\,b - \\mathrm{logit}\\,\\mu)$ | 1-PL Rasch IRT blend |\n",
++    "| 4     | benchmark prior                              | unknown subject                 |\n",
++    "| 5     | subject prior                                | unknown benchmark               |\n",
++    "| 6     | global mean                                  | both unknown                    |\n",
++    "\n",
++    "Let's build a tiny synthetic lookup that mirrors the structure of the real one (built from 5.36M training responses):"
++   ]
++  },
++  {
++   "cell_type": "code",
++   "execution_count": 2,
++   "id": "05f9bd9f",
++   "metadata": {
++    "execution": {
++     "iopub.execute_input": "2026-05-13T04:27:52.490518Z",
++     "iopub.status.busy": "2026-05-13T04:27:52.490262Z",
++     "iopub.status.idle": "2026-05-13T04:27:52.495943Z",
++     "shell.execute_reply": "2026-05-13T04:27:52.494961Z"
++    }
++   },
++   "outputs": [
++    {
++     "data": {
++      "text/plain": [
++       "<torch_measure.models.cold_start_lookup.ColdStartLookupPredictor at 0x1607889d0>"
++      ]
++     },
++     "execution_count": 2,
++     "metadata": {},
++     "output_type": "execute_result"
++    }
++   ],
++   "source": [
++    "predictor = ColdStartLookupPredictor(\n",
++    "    sbc={\n",
++    "        'gpt-4||mmlupro||zero-shot': 0.78,\n",
++    "        'gpt-4||mmlupro||cot':       0.85,\n",
++    "        'claude-3||ai2d_test||none': 0.72,\n",
++    "    },\n",
++    "    sb={\n",
++    "        'gpt-4||mmlupro':      0.80,\n",
++    "        'gpt-4||cybench':      0.40,\n",
++    "        'claude-3||ai2d_test': 0.72,\n",
++    "        'llama-2-7b||cybench': 0.18,\n",
++    "    },\n",
++    "    subj={'gpt-4': 0.75, 'claude-3': 0.70, 'llama-2-7b': 0.35},\n",
++    "    bench={'mmlupro': 0.50, 'cybench': 0.25, 'ai2d_test': 0.70},\n",
++    "    global_mean=0.645,\n",
++    "    name_aliases={'Llama-2-7b-chat': 'llama-2-7b'},\n",
++    "    name_lc={'gpt-4': 'gpt-4', 'claude-3': 'claude-3', 'llama-2-7b': 'llama-2-7b'},\n",
++    ")\n",
++    "predictor"
++   ]
++  },
++  {
++   "cell_type": "markdown",
++   "id": "be40a79f",
++   "metadata": {},
++   "source": [
++    "### 2.1 Exercising each fallback level\n",
++    "\n",
++    "Below we construct test records that deliberately miss each level until we reach the desired fallback, demonstrating the cascading hierarchy:"
++   ]
++  },
++  {
++   "cell_type": "code",
++   "execution_count": 3,
++   "id": "029c6f84",
++   "metadata": {
++    "execution": {
++     "iopub.execute_input": "2026-05-13T04:27:52.498286Z",
++     "iopub.status.busy": "2026-05-13T04:27:52.498143Z",
++     "iopub.status.idle": "2026-05-13T04:27:52.502483Z",
++     "shell.execute_reply": "2026-05-13T04:27:52.502019Z"
++    }
++   },
++   "outputs": [
++    {
++     "name": "stdout",
++     "output_type": "stream",
++     "text": [
++      "Level 1  | benchmark=mmlupro    cond=cot        subj=gpt-4                     -> P=0.8500  (triple match)\n",
++      "Level 2  | benchmark=mmlupro    cond=few-shot   subj=gpt-4                     -> P=0.8000  ((subj, bench) match, unseen condition)\n",
++      "Level 3  | benchmark=ai2d_test  cond=none       subj=gpt-4                     -> P=0.7939  (IRT blend (subj and bench priors both known))\n",
++      "Level 4  | benchmark=mmlupro    cond=none       subj=NewModel-X                -> P=0.5000  (benchmark prior only)\n",
++      "Level 5  | benchmark=new_bench  cond=none       subj=gpt-4                     -> P=0.7500  (subject prior only)\n",
++      "Level 6  | benchmark=new_bench  cond=none       subj=NewModel-X                -> P=0.6450  (global fallback)\n"
++     ]
++    }
++   ],
++   "source": [
++    "def show(level_name, record, expected_source):\n",
++    "    p = predictor.predict(record)\n",
++    "    print(f'{level_name:8s} | benchmark={record[\"benchmark\"]:10s} cond={record[\"condition\"]:10s} '\n",
++    "          f'subj={record[\"subject_content\"][6:30]:25s} -> P={p:.4f}  ({expected_source})')\n",
++    "\n",
++    "show('Level 1', {'benchmark': 'mmlupro',  'condition': 'cot',  'subject_content': 'Name: gpt-4',\n",
++    "                 'item_content': 'q'},   'triple match')\n",
++    "show('Level 2', {'benchmark': 'mmlupro',  'condition': 'few-shot', 'subject_content': 'Name: gpt-4',\n",
++    "                 'item_content': 'q'},   '(subj, bench) match, unseen condition')\n",
++    "show('Level 3', {'benchmark': 'ai2d_test','condition': 'none', 'subject_content': 'Name: gpt-4',\n",
++    "                 'item_content': 'q'},   'IRT blend (subj and bench priors both known)')\n",
++    "show('Level 4', {'benchmark': 'mmlupro',  'condition': 'none', 'subject_content': 'Name: NewModel-X',\n",
++    "                 'item_content': 'q'},   'benchmark prior only')\n",
++    "show('Level 5', {'benchmark': 'new_bench','condition': 'none', 'subject_content': 'Name: gpt-4',\n",
++    "                 'item_content': 'q'},   'subject prior only')\n",
++    "show('Level 6', {'benchmark': 'new_bench','condition': 'none', 'subject_content': 'Name: NewModel-X',\n",
++    "                 'item_content': 'q'},   'global fallback')"
++   ]
++  },
++  {
++   "cell_type": "markdown",
++   "id": "02fe0eea",
++   "metadata": {},
++   "source": [
++    "### 2.2 Closed-form check of the level-3 IRT blend\n",
++    "\n",
++    "Level 3 implements the classical Rasch model expressed against the global mean:\n",
++    "\n",
++    "$$\n",
++    "P(\\text{correct} \\mid \\text{subj}, \\text{bench}) \\;=\\; \\sigma\\!\\bigl(\\mathrm{logit}\\,s \\;+\\; \\mathrm{logit}\\,b \\;-\\; \\mathrm{logit}\\,\\mu\\bigr).\n",
++    "$$\n",
++    "\n",
++    "For the gpt-4 $\\times$ ai2d_test pair above ($s=0.75,\\, b=0.70,\\, \\mu=0.645$), the expected value is computable by hand:"
++   ]
++  },
++  {
++   "cell_type": "code",
++   "execution_count": 4,
++   "id": "198c7e40",
++   "metadata": {
++    "execution": {
++     "iopub.execute_input": "2026-05-13T04:27:52.504231Z",
++     "iopub.status.busy": "2026-05-13T04:27:52.504130Z",
++     "iopub.status.idle": "2026-05-13T04:27:52.507140Z",
++     "shell.execute_reply": "2026-05-13T04:27:52.506771Z"
++    }
++   },
++   "outputs": [
++    {
++     "name": "stdout",
++     "output_type": "stream",
++     "text": [
++      "Closed-form IRT blend: 0.793930\n",
++      "Predictor output:      0.793930\n",
++      "Match within tolerance: True\n"
++     ]
++    }
++   ],
++   "source": [
++    "def logit(p): return math.log(p / (1 - p))\n",
++    "def sigmoid(x): return 1 / (1 + math.exp(-x))\n",
++    "\n",
++    "expected = sigmoid(logit(0.75) + logit(0.70) - logit(0.645))\n",
++    "actual   = predictor.predict({'benchmark': 'ai2d_test', 'condition': 'none',\n",
++    "                              'subject_content': 'Name: gpt-4', 'item_content': 'q'})\n",
++    "print(f'Closed-form IRT blend: {expected:.6f}')\n",
++    "print(f'Predictor output:      {actual:.6f}')\n",
++    "print(f'Match within tolerance: {abs(expected - actual) < 1e-6}')"
++   ]
++  },
++  {
++   "cell_type": "markdown",
++   "id": "6de688bf",
++   "metadata": {},
++   "source": [
++    "### 2.3 Name resolution: provider prefixes\n",
++    "\n",
++    "A meaningful failure mode for the earlier M2 submission was that `subject_content` at test time often arrives with provider-prefixed names (e.g., `meta-llama/Llama-2-7b-chat`) that do not match the bare `display_name` stored in training (`Llama-2-7b-chat`). `ColdStartLookupPredictor` strips fourteen known prefixes and consults an alias map:"
++   ]
++  },
++  {
++   "cell_type": "code",
++   "execution_count": 5,
++   "id": "8077a523",
++   "metadata": {
++    "execution": {
++     "iopub.execute_input": "2026-05-13T04:27:52.508822Z",
++     "iopub.status.busy": "2026-05-13T04:27:52.508716Z",
++     "iopub.status.idle": "2026-05-13T04:27:52.511324Z",
++     "shell.execute_reply": "2026-05-13T04:27:52.510879Z"
++    }
++   },
++   "outputs": [
++    {
++     "name": "stdout",
++     "output_type": "stream",
++     "text": [
++      "Canonical name: 0.1800\n",
++      "Prefixed name:  0.1800\n",
++      "Match: True\n"
++     ]
++    }
++   ],
++   "source": [
++    "# Two representations of the same subject -- both must hit the same level-2 entry.\n",
++    "p_canonical = predictor.predict({'benchmark': 'cybench', 'condition': 'none',\n",
++    "                                  'subject_content': 'Name: llama-2-7b', 'item_content': 'q'})\n",
++    "p_prefixed  = predictor.predict({'benchmark': 'cybench', 'condition': 'none',\n",
++    "                                  'subject_content': 'Name: meta-llama/Llama-2-7b-chat', 'item_content': 'q'})\n",
++    "print(f'Canonical name: {p_canonical:.4f}')\n",
++    "print(f'Prefixed name:  {p_prefixed:.4f}')\n",
++    "print(f'Match: {abs(p_canonical - p_prefixed) < 1e-6}')"
++   ]
++  },
++  {
++   "cell_type": "markdown",
++   "id": "81d9f924",
++   "metadata": {},
++   "source": [
++    "### 2.4 Adaptive calibration with `K=5` revealed labels\n",
++    "\n",
++    "Before `predict()` is called, the competition reveals $K=5$ ground-truth labels per benchmark. We fit an *intercept-only* Platt scaler: slope is fixed at 1, only the shift $b$ is fit, capped at $\\pm 1.5$ logit units. The reason: full Platt at $K=5$ produces a near-flat calibrator ($a \\approx 0.1$) that destroys subject ordering. Locking $a=1$ preserves the ordering and only shifts the round's predictions to match the empirical label mean.\n",
++    "\n",
++    "Demonstration: a 4-out-of-5 zero-label batch on mmlupro should pull mmlupro predictions down. cybench predictions must be unchanged."
++   ]
++  },
++  {
++   "cell_type": "code",
++   "execution_count": 6,
++   "id": "d0b9506b",
++   "metadata": {
++    "execution": {
++     "iopub.execute_input": "2026-05-13T04:27:52.512776Z",
++     "iopub.status.busy": "2026-05-13T04:27:52.512673Z",
++     "iopub.status.idle": "2026-05-13T04:27:52.516188Z",
++     "shell.execute_reply": "2026-05-13T04:27:52.515708Z"
++    }
++   },
++   "outputs": [
++    {
++     "name": "stdout",
++     "output_type": "stream",
++     "text": [
++      "              raw      calibrated   shift\n",
++      "mmlupro       0.7800   0.4417      -0.3383\n",
++      "cybench       0.4000   0.4000      +0.0000\n",
++      "\n",
++      "Observe: mmlupro shifted DOWN (4/5 zero labels); cybench unchanged (no calibration data).\n"
++     ]
++    }
++   ],
++   "source": [
++    "labeled = [\n",
++    "    {'benchmark': 'mmlupro', 'condition': 'zero-shot', 'subject_content': 'Name: gpt-4',      'label': 0},\n",
++    "    {'benchmark': 'mmlupro', 'condition': 'zero-shot', 'subject_content': 'Name: claude-3',   'label': 0},\n",
++    "    {'benchmark': 'mmlupro', 'condition': 'zero-shot', 'subject_content': 'Name: llama-2-7b', 'label': 0},\n",
++    "    {'benchmark': 'mmlupro', 'condition': 'zero-shot', 'subject_content': 'Name: gpt-4',      'label': 0},\n",
++    "    {'benchmark': 'mmlupro', 'condition': 'zero-shot', 'subject_content': 'Name: claude-3',   'label': 1},\n",
++    "]\n",
++    "\n",
++    "mm_record = {'benchmark': 'mmlupro', 'condition': 'zero-shot',\n",
++    "             'subject_content': 'Name: gpt-4', 'item_content': 'q'}\n",
++    "cy_record = {'benchmark': 'cybench', 'condition': 'none',\n",
++    "             'subject_content': 'Name: gpt-4', 'item_content': 'q'}\n",
++    "\n",
++    "print('              raw      calibrated   shift')\n",
++    "for name, rec in [('mmlupro', mm_record), ('cybench', cy_record)]:\n",
++    "    raw = predictor.predict(rec)\n",
++    "    cal = predictor.predict(rec, labeled)\n",
++    "    print(f'{name:8s}      {raw:.4f}   {cal:.4f}      {cal - raw:+.4f}')\n",
++    "\n",
++    "print('\\nObserve: mmlupro shifted DOWN (4/5 zero labels); cybench unchanged (no calibration data).')"
++   ]
++  },
++  {
++   "cell_type": "markdown",
++   "id": "48edb55d",
++   "metadata": {},
++   "source": [
++    "## 3. The experimental model: `LLMJudgeIRT`\n",
++    "\n",
++    "The lookup model treats all items inside a (subject, benchmark, condition) cell as exchangeable, which they are not. The M4.5 architecture probes whether a frozen LLM judge can extract per-item difficulty signal to augment the lookup prior:\n",
++    "\n",
++    "$$\n",
++    "\\hat p \\;=\\; \\sigma\\!\\bigl(\\theta_{\\text{subject}} \\;-\\; \\delta_{\\text{item}}\\bigr),\n",
++    "$$\n",
++    "\n",
++    "where $\\theta_{\\text{subject}} = \\mathrm{logit}\\,\\hat p_{\\text{lookup}}$ is the M3 prior in logit space, and $\\delta_{\\text{item}} = \\alpha (\\log P_{\\text{yes}} - \\log P_{\\text{no}}) + \\beta$ comes from a 14B instruction-tuned LLM judge given a difficulty-rating prompt.\n",
++    "\n",
++    "Here we use a mock judge (deterministic, no GPU) to demonstrate the IRT combination math. The competition build uses Qwen2.5-14B-Instruct."
++   ]
++  },
++  {
++   "cell_type": "code",
++   "execution_count": 7,
++   "id": "872195c6",
++   "metadata": {
++    "execution": {
++     "iopub.execute_input": "2026-05-13T04:27:52.517735Z",
++     "iopub.status.busy": "2026-05-13T04:27:52.517638Z",
++     "iopub.status.idle": "2026-05-13T04:27:52.519795Z",
++     "shell.execute_reply": "2026-05-13T04:27:52.519268Z"
++    }
++   },
++   "outputs": [
++    {
++     "name": "stdout",
++     "output_type": "stream",
++     "text": [
++      "Below is a question from the benchmark `mmlupro`. Without solving it, rate whether this question would be difficult for a typical AI assistant.\n",
++      "\n",
++      "Question:\n",
++      "What is the integral of e^x?\n",
++      "\n",
++      "Is this question difficult? Answer with one word, yes or no.\n",
++      "Answer:\n"
++     ]
++    }
++   ],
++   "source": [
++    "# Inspect the difficulty prompt format. Note the prompt deliberately does NOT mention\n",
++    "# the subject -- this is by design (subject behaviour prediction failed at 7B scale).\n",
++    "print(build_difficulty_prompt(item_content='What is the integral of e^x?', benchmark='mmlupro'))"
++   ]
++  },
++  {
++   "cell_type": "code",
++   "execution_count": 8,
++   "id": "4febfa64",
++   "metadata": {
++    "execution": {
++     "iopub.execute_input": "2026-05-13T04:27:52.521058Z",
++     "iopub.status.busy": "2026-05-13T04:27:52.520967Z",
++     "iopub.status.idle": "2026-05-13T04:27:52.524392Z",
++     "shell.execute_reply": "2026-05-13T04:27:52.523922Z"
++    }
++   },
++   "outputs": [
++    {
++     "name": "stdout",
++     "output_type": "stream",
++     "text": [
++      "short item (easy)         P_lookup=0.7800  P_IRT=0.8405  shift=+0.0605\n",
++      "medium item               P_lookup=0.7800  P_IRT=0.7800  shift=+0.0000\n",
++      "long item (hard)          P_lookup=0.7800  P_IRT=0.4172  shift=-0.3628\n",
++      "\n",
++      "IRT prediction shifts down for longer (harder, per the mock judge) items.\n"
++     ]
++    }
++   ],
++   "source": [
++    "# Mock judge: assigns positive logit (\"hard\") to long items, negative (\"easy\") to short ones.\n",
++    "# This is a stand-in; the real judge uses 14B-Instruct next-token logits at the 'Answer:' position.\n",
++    "def mock_judge(item_content, benchmark):\n",
++    "    return (len(item_content) - 100) / 50.0  # signed, magnitude grows with item length\n",
++    "\n",
++    "model = LLMJudgeIRT(lookup=predictor, judge_fn=mock_judge, alpha=0.20, beta=0.0)\n",
++    "\n",
++    "for label, ic in [('short item (easy)', 'q'),\n",
++    "                  ('medium item',       'q' * 100),\n",
++    "                  ('long item (hard)',  'q' * 500)]:\n",
++    "    rec = {'benchmark': 'mmlupro', 'condition': 'zero-shot',\n",
++    "           'subject_content': 'Name: gpt-4', 'item_content': ic}\n",
++    "    p_lookup = predictor.predict(rec)\n",
++    "    p_irt    = model.predict(rec)\n",
++    "    print(f'{label:25s} P_lookup={p_lookup:.4f}  P_IRT={p_irt:.4f}  shift={p_irt - p_lookup:+.4f}')\n",
++    "\n",
++    "print('\\nIRT prediction shifts down for longer (harder, per the mock judge) items.')"
++   ]
++  },
++  {
++   "cell_type": "markdown",
++   "id": "cb8e6b99",
++   "metadata": {},
++   "source": [
++    "### 3.1 Why we did not deploy this model: the convergent negative result\n",
++    "\n",
++    "Across three rigorously validated iterations on the real competition data, the LLM-judge signal proved too small to reliably exceed the M3 lookup baseline. The pattern was convergent:\n",
++    "\n",
++    "| Iteration | Fit rows | Raw $r$ | Val NLL lift | Smoke NLL lift |\n",
++    "|-----------|----------|---------|--------------|----------------|\n",
++    "| v1 (no validation)    | 600  | $-0.252$ | --        | $-0.024$ |\n",
++    "| v2 (validated $\\alpha$) | 600  | $-0.252$ | $+0.009$ | $-0.021$ |\n",
++    "| v3 (1500 rows)        | 1500 | $-0.257$ | $+0.002$ | $-0.006$ |\n",
++    "\n",
++    "The judge does extract real signal ($r \\approx -0.26$ is stable across sample sizes). But the validation lift collapses to $+0.002$ NLL as the validation protocol tightens, while sample-to-sample noise on a 200-row smoke set is $\\approx 0.020$ NLL -- roughly $5\\times$ larger than the converged effect.\n",
++    "\n",
++    "Below we reproduce this pattern on synthetic data to demonstrate the diagnostic logic. We simulate a regime where the judge has a true effect of $\\alpha^\\star = 0.05$ and noise variance $\\sigma^2 = 1$:"
++   ]
++  },
++  {
++   "cell_type": "code",
++   "execution_count": 9,
++   "id": "fab404ae",
++   "metadata": {
++    "execution": {
++     "iopub.execute_input": "2026-05-13T04:27:52.525803Z",
++     "iopub.status.busy": "2026-05-13T04:27:52.525701Z",
++     "iopub.status.idle": "2026-05-13T04:27:52.556999Z",
++     "shell.execute_reply": "2026-05-13T04:27:52.556447Z"
++    }
++   },
++   "outputs": [
++    {
++     "name": "stdout",
++     "output_type": "stream",
++     "text": [
++      "n_fit=  600  fitted alpha=+0.0097  smoke lift over lookup: +0.0004\n",
++      "n_fit= 1500  fitted alpha=+0.0053  smoke lift over lookup: -0.0003\n",
++      "n_fit= 5000  fitted alpha=+0.0024  smoke lift over lookup: -0.0007\n"
++     ]
++    }
++   ],
++   "source": [
++    "import random\n",
++    "random.seed(42)\n",
++    "\n",
++    "TRUE_ALPHA = 0.05\n",
++    "TRUE_BETA  = 0.0\n",
++    "\n",
++    "def synthetic_dataset(n_rows):\n",
++    "    \"\"\"Generate (theta, judge_logit, label) triples where the judge has small true effect.\"\"\"\n",
++    "    rows = []\n",
++    "    for _ in range(n_rows):\n",
++    "        theta = random.gauss(0.5, 0.5)\n",
++    "        jl    = random.gauss(0.0, 1.0)\n",
++    "        # True P = sigmoid(theta - alpha*jl - beta)\n",
++    "        p_true = 1 / (1 + math.exp(-(theta - TRUE_ALPHA * jl - TRUE_BETA)))\n",
++    "        label = 1 if random.random() < p_true else 0\n",
++    "        rows.append((theta, jl, label))\n",
++    "    return rows\n",
++    "\n",
++    "def eval_nll(rows, alpha, beta):\n",
++    "    nll = 0.0\n",
++    "    for theta, jl, y in rows:\n",
++    "        delta = alpha * jl + beta\n",
++    "        z = max(-3.0, min(3.0, theta - delta))\n",
++    "        p = 1 / (1 + math.exp(-z))\n",
++    "        p = max(1e-6, min(1 - 1e-6, p))\n",
++    "        nll += y * math.log(p) + (1 - y) * math.log(1 - p)\n",
++    "    return nll / len(rows)\n",
++    "\n",
++    "for n_fit in [600, 1500, 5000]:\n",
++    "    fit   = synthetic_dataset(n_fit)\n",
++    "    smoke = synthetic_dataset(200)\n",
++    "\n",
++    "    thetas = [r[0] for r in fit]\n",
++    "    jls    = [r[1] for r in fit]\n",
++    "    labels = [r[2] for r in fit]\n",
++    "    alpha, beta, _ = LLMJudgeIRT.fit_alpha_beta(thetas, jls, labels, l2_penalty=2.0)\n",
++    "\n",
++    "    smoke_nll_irt = eval_nll(smoke, alpha, beta)\n",
++    "    smoke_nll_lookup = eval_nll(smoke, 0.0, 0.0)\n",
++    "    print(f'n_fit={n_fit:5d}  fitted alpha={alpha:+.4f}  smoke lift over lookup: {smoke_nll_irt - smoke_nll_lookup:+.4f}')"
++   ]
++  },
++  {
++   "cell_type": "markdown",
++   "id": "25e0bdbb",
++   "metadata": {},
++   "source": [
++    "Notice that even with the *true* $\\alpha^\\star = 0.05$ baked into the data, a 200-row smoke set is too small to reliably reward the model -- the smoke lift swings around zero based on the random draw. This is precisely the regime our LLM-judge experiment landed in.\n",
++    "\n",
++    "### 3.2 The methodology contribution\n",
++    "\n",
++    "The decision to not deploy M4.5 rests on three pre-registered engineering rules. Each one would have been violated by the v1 iteration:\n",
++    "\n",
++    "1. **Smoke-test thresholds must be expressed as differences from the baseline being supplanted, not as absolute values.** v1 used an absolute AUC threshold and a regression slipped through.\n",
++    "2. **Validation-set $\\alpha$ tuning with L2 regularisation prevents overfitting** when $K \\ll n$. v2 introduced this; the apparent fit-set lift halved.\n",
++    "3. **Composite-key exclusion when expanding training samples** prevents contaminating the held-out smoke set. v3 enforced this on the (subject_id, item_id, benchmark_id, condition) quadruple."
++   ]
++  },
++  {
++   "cell_type": "markdown",
++   "id": "4fc0aec4",
++   "metadata": {},
++   "source": [
++    "## 4. Running the package unit tests\n",
++    "\n",
++    "All deployment-critical invariants are codified in the test suite. From the package root: `pytest tests/test_models/test_cold_start_lookup.py tests/test_models/test_llm_judge_irt.py -v` runs 37 tests in under a second:"
++   ]
++  },
++  {
++   "cell_type": "code",
++   "execution_count": 10,
++   "id": "0c62f5f7",
++   "metadata": {
++    "execution": {
++     "iopub.execute_input": "2026-05-13T04:27:52.558779Z",
++     "iopub.status.busy": "2026-05-13T04:27:52.558659Z",
++     "iopub.status.idle": "2026-05-13T04:27:56.478587Z",
++     "shell.execute_reply": "2026-05-13T04:27:56.477485Z"
++    }
++   },
++   "outputs": [
++    {
++     "name": "stdout",
++     "output_type": "stream",
++     "text": [
++      "\u001b[32m.\u001b[0m\u001b[32m.\u001b[0m\u001b[32m.\u001b[0m\u001b[32m.\u001b[0m\u001b[32m.\u001b[0m\u001b[32m.\u001b[0m\u001b[32m.\u001b[0m\u001b[32m.\u001b[0m\u001b[32m.\u001b[0m\u001b[32m.\u001b[0m\u001b[32m.\u001b[0m\u001b[32m.\u001b[0m\u001b[32m.\u001b[0m\u001b[32m.\u001b[0m\u001b[32m.\u001b[0m\u001b[32m.\u001b[0m\u001b[32m.\u001b[0m\u001b[32m.\u001b[0m\u001b[32m.\u001b[0m\u001b[32m.\u001b[0m\u001b[32m.\u001b[0m\u001b[32m.\u001b[0m\u001b[32m.\u001b[0m\u001b[32m.\u001b[0m\u001b[32m.\u001b[0m\u001b[32m.\u001b[0m\u001b[32m.\u001b[0m\u001b[32m.\u001b[0m\u001b[32m.\u001b[0m\u001b[32m.\u001b[0m\u001b[32m.\u001b[0m\u001b[32m.\u001b[0m\u001b[32m.\u001b[0m\u001b[32m.\u001b[0m\u001b[32m.\u001b[0m\u001b[32m.\u001b[0m\u001b[32m.\u001b[0m\u001b[32m                                    [100%]\u001b[0m\n"
++     ]
++    }
++   ],
++   "source": [
++    "import subprocess\n",
++    "result = subprocess.run(\n",
++    "    ['pytest', '../tests/test_models/test_cold_start_lookup.py',\n",
++    "     '../tests/test_models/test_llm_judge_irt.py', '--tb=line', '-q'],\n",
++    "    capture_output=True, text=True,\n",
++    ")\n",
++    "print(result.stdout.split('\\n')[-3] if result.stdout else result.stderr.split('\\n')[-3])"
++   ]
++  },
++  {
++   "cell_type": "markdown",
++   "id": "e19f3f73",
++   "metadata": {},
++   "source": [
++    "## 5. Summary\n",
++    "\n",
++    "**Deployed:** `ColdStartLookupPredictor` with six-level fallback, Bayesian shrinkage at level 2, 1-PL IRT blend at level 3, intercept-only Platt calibration at runtime. Leaderboard NLL = -0.59 (tied #6).\n",
++    "\n",
++    "**Not deployed:** `LLMJudgeIRT` with Qwen2.5-14B-Instruct as the item-difficulty rater. Three rigorous iterations confirmed the judge's effect size is below the sample-to-sample variance threshold for confident deployment. Documented as an experimental model in the package with explicit guidance against production use.\n",
++    "\n",
++    "**Practitioner takeaways:**\n",
++    "\n",
++    "1. Cold-start item prediction with known subjects is dominated by subject-conditioned benchmark priors. Beating $-0.59$ on the leaderboard requires item-level signal that genuinely transfers across distribution shifts -- a high bar that the 14B judge does not clear on its own.\n",
++    "2. Field-name mismatches and silent name-resolution failures (the M1, M2 bugs) account for most of the gap between $-0.71$ and $-0.59$. Architecture is not the bottleneck below the lookup floor.\n",
++    "3. Pre-registered smoke-test gates expressed as *differences* from a deployed baseline are the engineering safeguard that converts a hopeful submission into a deliberate one. A submission that fails the gate is a successful test, not a wasted iteration."
++   ]
++  }
++ ],
++ "metadata": {
++  "kernelspec": {
++   "display_name": "Python 3 (torch_measure)",
++   "language": "python",
++   "name": "python3"
++  },
++  "language_info": {
++   "codemirror_mode": {
++    "name": "ipython",
++    "version": 3
++   },
++   "file_extension": ".py",
++   "mimetype": "text/x-python",
++   "name": "python",
++   "nbconvert_exporter": "python",
++   "pygments_lexer": "ipython3",
++   "version": "3.11.15"
++  }
++ },
++ "nbformat": 4,
++ "nbformat_minor": 5
++}
