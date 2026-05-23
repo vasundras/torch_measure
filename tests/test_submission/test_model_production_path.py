@@ -42,7 +42,15 @@ class FakeEncoder:
         self.device = device
         self.local_files_only = local_files_only
 
-    def encode(self, text, *, convert_to_numpy=False, convert_to_tensor=False, show_progress_bar=False, normalize_embeddings=False):
+    def encode(
+        self,
+        text,
+        *,
+        convert_to_numpy=False,
+        convert_to_tensor=False,
+        show_progress_bar=False,
+        normalize_embeddings=False,
+    ):
         import hashlib
 
         digest = hashlib.blake2b(text.encode("utf-8"), digest_size=8).digest()
@@ -206,3 +214,91 @@ class TestProductionPredictPath:
         assert isinstance(p, float)
         assert math.isfinite(p)
         assert 1e-4 <= p <= 1 - 1e-4
+
+
+def test_initialize_runtime_device_override_wins_over_stale_module_device(tmp_path, monkeypatch):
+    """Regression test for B5: an explicit ``device=`` argument to
+    ``_initialize_runtime`` must WIN over a stale ``module.DEVICE`` global
+    that was set by a prior session, by a stale ``torch.cuda.is_available``
+    check, or by a test stub.
+
+    The scenario: a CUDA-state ``caimira_lite.pt`` is loaded into a CPU-only
+    test process. The module-level DEVICE may already say ``cuda`` from the
+    initial probe (or be set to ``meta`` by a test setup). The explicit
+    ``device=torch.device("cpu")`` argument should:
+
+    1. Update ``module.DEVICE`` to ``torch.device("cpu")``.
+    2. Move CAIMIRA's parameters to CPU (so ``next(model.CAIMIRA.parameters()).device``
+       reports ``cpu``).
+    3. Make subsequent ``_encode_item`` calls send embeddings to CPU (this
+       is the B2 fix path — covered by the production tests above).
+    """
+    monkeypatch.delenv("PREDICTIVE_EVAL_LOCAL_SMOKE_TEST", raising=False)
+
+    import importlib
+    import json
+
+    from caimira_lite import CAIMIRALite
+
+    n_subjects, n_items, embed_dim, latent_dim = 2, 2, 768, 5
+    head = CAIMIRALite(
+        n_subjects=n_subjects,
+        n_items=n_items,
+        embedding_dim=embed_dim,
+        latent_dim=latent_dim,
+    )
+    head_path = tmp_path / "caimira_lite.pt"
+    meta_path = tmp_path / "caimira_lite.meta.json"
+    eb_path = tmp_path / "eb_tables.json"
+    torch.save(head.state_dict(), head_path)
+    meta_path.write_text(
+        json.dumps(
+            {
+                "n_subjects": n_subjects,
+                "n_items": n_items,
+                "embed_dim": embed_dim,
+                "latent_dim": latent_dim,
+                "subject_to_idx": {"gpt-4": 0, "claude-3": 1},
+            }
+        )
+    )
+    eb_path.write_text(
+        json.dumps(
+            {
+                "sbc": {},
+                "sb": {},
+                "subj": {"gpt-4": 0.7, "claude-3": 0.6},
+                "bench": {"mmlupro": 0.5},
+                "global": 0.55,
+                "name_aliases": {},
+                "name_lc": {"gpt-4": "gpt-4", "claude-3": "claude-3"},
+            }
+        )
+    )
+
+    model = importlib.reload(importlib.import_module("model"))
+
+    # Deliberately corrupt the module-level DEVICE BEFORE the call. Use
+    # ``cuda`` if available (the most production-realistic stale value) but
+    # fall back to ``meta`` on CPU-only hosts so the test still pokes the
+    # "stale module global" path. The explicit ``device=`` argument must win.
+    stale_device = torch.device("cuda") if torch.cuda.is_available() else torch.device("meta")
+    model.DEVICE = stale_device
+
+    model._initialize_runtime(
+        head_path=head_path,
+        meta_path=meta_path,
+        eb_path=eb_path,
+        encoder_factory=FakeEncoder,
+        device=torch.device("cpu"),
+    )
+
+    assert torch.device("cpu") == model.DEVICE, (
+        f"DEVICE not overridden: explicit device=cpu was passed, but module.DEVICE={model.DEVICE!r}; "
+        f"started from stale={stale_device!r}."
+    )
+    caimira_param_device = next(model.CAIMIRA.parameters()).device
+    assert caimira_param_device == torch.device("cpu"), (
+        f"CAIMIRA params not on CPU: got {caimira_param_device!r}; "
+        "the explicit device= argument should have moved the head to CPU."
+    )

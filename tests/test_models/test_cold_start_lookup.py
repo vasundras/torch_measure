@@ -103,9 +103,7 @@ class TestLookupLevels:
         p = predictor.predict(_make_record("mmlupro", "zero-shot", "gpt-4"))
         assert abs(p - 0.78) < 1e-6
 
-    def test_level1_falls_to_none_within_level(
-        self, predictor: ColdStartLookupPredictor
-    ) -> None:
+    def test_level1_falls_to_none_within_level(self, predictor: ColdStartLookupPredictor) -> None:
         """Unknown condition: tries `none` condition before falling out to L2."""
         # claude-3 has sbc[claude-3||ai2d_test||none] = 0.72.
         # An unseen condition `xyz` should still hit level 1 via the `none` fallback.
@@ -145,8 +143,7 @@ class TestLookupLevels:
 class TestNameResolution:
     def test_provider_prefix_stripped(self, predictor: ColdStartLookupPredictor) -> None:
         """meta-llama/Llama-2-7b-chat -> alias -> llama-2-7b -> sb hit."""
-        p = predictor.predict(_make_record("cybench", "none",
-                                          "meta-llama/Llama-2-7b-chat"))
+        p = predictor.predict(_make_record("cybench", "none", "meta-llama/Llama-2-7b-chat"))
         assert abs(p - 0.18) < 1e-6
 
     def test_case_insensitive_subject(self, predictor: ColdStartLookupPredictor) -> None:
@@ -183,32 +180,20 @@ class TestNameResolution:
 
 
 class TestCalibration:
-    def test_calibration_shifts_target_benchmark(
-        self, predictor: ColdStartLookupPredictor
-    ) -> None:
+    def test_calibration_shifts_target_benchmark(self, predictor: ColdStartLookupPredictor) -> None:
         """Labels that look hard pull predictions DOWN for that benchmark."""
         labeled = [
-            {"benchmark": "mmlupro", "condition": "zero-shot",
-             "subject_content": "Name: gpt-4", "label": 0},
-            {"benchmark": "mmlupro", "condition": "zero-shot",
-             "subject_content": "Name: claude-3", "label": 0},
-            {"benchmark": "mmlupro", "condition": "zero-shot",
-             "subject_content": "Name: llama-2-7b", "label": 0},
-            {"benchmark": "mmlupro", "condition": "zero-shot",
-             "subject_content": "Name: gpt-4", "label": 0},
-            {"benchmark": "mmlupro", "condition": "zero-shot",
-             "subject_content": "Name: claude-3", "label": 1},
+            {"benchmark": "mmlupro", "condition": "zero-shot", "subject_content": "Name: gpt-4", "label": 0},
+            {"benchmark": "mmlupro", "condition": "zero-shot", "subject_content": "Name: claude-3", "label": 0},
+            {"benchmark": "mmlupro", "condition": "zero-shot", "subject_content": "Name: llama-2-7b", "label": 0},
+            {"benchmark": "mmlupro", "condition": "zero-shot", "subject_content": "Name: gpt-4", "label": 0},
+            {"benchmark": "mmlupro", "condition": "zero-shot", "subject_content": "Name: claude-3", "label": 1},
         ]
         raw = predictor.predict(_make_record("mmlupro", "zero-shot", "gpt-4"))
         cal = predictor.predict(_make_record("mmlupro", "zero-shot", "gpt-4"), labeled)
-        assert cal < raw - 0.01, (
-            f"Expected calibration to lower the prediction; got raw={raw:.4f}, "
-            f"cal={cal:.4f}"
-        )
+        assert cal < raw - 0.01, f"Expected calibration to lower the prediction; got raw={raw:.4f}, cal={cal:.4f}"
 
-    def test_calibration_does_not_contaminate_other_benchmarks(
-        self, predictor: ColdStartLookupPredictor
-    ) -> None:
+    def test_calibration_does_not_contaminate_other_benchmarks(self, predictor: ColdStartLookupPredictor) -> None:
         """A mmlupro-labeled list must not change cybench predictions."""
         labeled = [
             {"benchmark": "mmlupro", "subject_content": "Name: gpt-4", "label": 0},
@@ -219,13 +204,9 @@ class TestCalibration:
         ]
         raw = predictor.predict(_make_record("cybench", "none", "gpt-4"))
         cal = predictor.predict(_make_record("cybench", "none", "gpt-4"), labeled)
-        assert abs(cal - raw) < 1e-6, (
-            f"cybench prediction changed by mmlupro calibration: raw={raw:.4f}, cal={cal:.4f}"
-        )
+        assert abs(cal - raw) < 1e-6, f"cybench prediction changed by mmlupro calibration: raw={raw:.4f}, cal={cal:.4f}"
 
-    def test_calibration_skips_singletons(
-        self, predictor: ColdStartLookupPredictor
-    ) -> None:
+    def test_calibration_skips_singletons(self, predictor: ColdStartLookupPredictor) -> None:
         """A single labeled example for a benchmark should not produce a calibrator."""
         labeled = [
             {"benchmark": "mmlupro", "subject_content": "Name: gpt-4", "label": 0},
@@ -233,9 +214,7 @@ class TestCalibration:
         predictor.calibrate(labeled)
         assert "mmlupro" not in predictor._platt
 
-    def test_calibration_skips_malformed_labels(
-        self, predictor: ColdStartLookupPredictor
-    ) -> None:
+    def test_calibration_skips_malformed_labels(self, predictor: ColdStartLookupPredictor) -> None:
         labeled = [
             {"benchmark": "mmlupro", "subject_content": "Name: gpt-4", "label": "bad"},
             {"benchmark": "mmlupro", "subject_content": "Name: claude-3", "label": 1},
@@ -244,9 +223,7 @@ class TestCalibration:
         predictor.calibrate(labeled)
         assert "mmlupro" in predictor._platt
 
-    def test_calibration_shift_is_capped(
-        self, predictor: ColdStartLookupPredictor
-    ) -> None:
+    def test_calibration_shift_is_capped(self, predictor: ColdStartLookupPredictor) -> None:
         """All-zeros labels would imply an infinite negative shift; we cap it."""
         labeled = [
             {"benchmark": "mmlupro", "subject_content": "Name: gpt-4", "label": 0},
@@ -256,10 +233,15 @@ class TestCalibration:
         predictor.calibrate(labeled)
         assert "mmlupro" not in predictor._platt
 
-    def test_calibration_caches_by_length(
-        self, predictor: ColdStartLookupPredictor
-    ) -> None:
-        """Re-calling calibrate with the same-length list is a no-op."""
+    def test_calibration_is_deterministic_for_identical_input(self, predictor: ColdStartLookupPredictor) -> None:
+        """Repeated calls with the SAME labeled list produce identical Platt state.
+
+        Earlier this method was a `len(labeled)`-keyed cache short-circuit. The
+        cache was removed in the Lane B / PR #2 v2 round because library callers
+        may pass distinct labeled lists of equal length within one process, and
+        a length-key cache would silently return stale shifts for the second
+        call. The behavior we now pin is determinism on identical input.
+        """
         labeled = [
             {"benchmark": "mmlupro", "subject_content": "Name: gpt-4", "label": 0},
             {"benchmark": "mmlupro", "subject_content": "Name: claude-3", "label": 1},
@@ -269,6 +251,39 @@ class TestCalibration:
         predictor.calibrate(labeled)
         assert predictor._platt == first_state
 
+    def test_calibration_refits_on_same_length_different_content(self, predictor: ColdStartLookupPredictor) -> None:
+        """A second calibrate() with same length but different LABELS must
+        produce different Platt shifts. Regression guard against the
+        previously-cached ``_platt_fit_key = len(labeled)`` short-circuit
+        that would have returned the FIRST fit's shifts unchanged.
+        """
+        labeled_all_zeros = [
+            {"benchmark": "mmlupro", "subject_content": "Name: gpt-4", "label": 0},
+            {"benchmark": "mmlupro", "subject_content": "Name: claude-3", "label": 0},
+            {"benchmark": "mmlupro", "subject_content": "Name: gpt-4", "label": 0},
+            {"benchmark": "mmlupro", "subject_content": "Name: claude-3", "label": 1},
+        ]
+        labeled_mostly_ones = [
+            {"benchmark": "mmlupro", "subject_content": "Name: gpt-4", "label": 1},
+            {"benchmark": "mmlupro", "subject_content": "Name: claude-3", "label": 1},
+            {"benchmark": "mmlupro", "subject_content": "Name: gpt-4", "label": 1},
+            {"benchmark": "mmlupro", "subject_content": "Name: claude-3", "label": 0},
+        ]
+        assert len(labeled_all_zeros) == len(labeled_mostly_ones)
+
+        predictor.calibrate(labeled_all_zeros)
+        shift_low = predictor._platt["mmlupro"][1]
+
+        predictor.calibrate(labeled_mostly_ones)
+        shift_high = predictor._platt["mmlupro"][1]
+
+        # mostly_ones should push the shift UP (positive) relative to all_zeros.
+        assert shift_high > shift_low + 0.5, (
+            f"calibrate did not refit on same-length-different-content; "
+            f"shift_low={shift_low:.4f}, shift_high={shift_high:.4f}. "
+            "Did a len(labeled)-key cache get reintroduced?"
+        )
+
 
 # ---- IRT-blend math (level 3) ----------------------------------------------
 
@@ -277,23 +292,29 @@ class TestIRTBlend:
     def test_blend_with_unit_global(self) -> None:
         """If global mean equals subj prior, the blend reduces to bench prior."""
         predictor = ColdStartLookupPredictor(
-            sbc={}, sb={}, subj={"X": 0.6}, bench={"B": 0.4},
+            sbc={},
+            sb={},
+            subj={"X": 0.6},
+            bench={"B": 0.4},
             global_mean=0.6,
-            name_aliases={}, name_lc={"x": "X"},
+            name_aliases={},
+            name_lc={"x": "X"},
         )
-        p = predictor.predict({"benchmark": "B", "condition": "none",
-                               "subject_content": "Name: X", "item_content": ""})
+        p = predictor.predict({"benchmark": "B", "condition": "none", "subject_content": "Name: X", "item_content": ""})
         assert abs(p - 0.4) < 1e-6
 
     def test_blend_above_global_pushes_up(self) -> None:
         """High subj + high bench relative to global -> blend > both single priors."""
         predictor = ColdStartLookupPredictor(
-            sbc={}, sb={}, subj={"X": 0.8}, bench={"B": 0.7},
+            sbc={},
+            sb={},
+            subj={"X": 0.8},
+            bench={"B": 0.7},
             global_mean=0.5,
-            name_aliases={}, name_lc={"x": "X"},
+            name_aliases={},
+            name_lc={"x": "X"},
         )
-        p = predictor.predict({"benchmark": "B", "condition": "none",
-                               "subject_content": "Name: X", "item_content": ""})
+        p = predictor.predict({"benchmark": "B", "condition": "none", "subject_content": "Name: X", "item_content": ""})
         assert p > 0.8 and p < 0.95
 
 
@@ -301,9 +322,7 @@ class TestIRTBlend:
 
 
 class TestPersistence:
-    def test_round_trip_via_json(
-        self, predictor: ColdStartLookupPredictor, tmp_path
-    ) -> None:
+    def test_round_trip_via_json(self, predictor: ColdStartLookupPredictor, tmp_path) -> None:
         path = tmp_path / "lookup.json"
         predictor.to_lookup_json(path)
         loaded = ColdStartLookupPredictor.from_lookup_json(path)
@@ -334,32 +353,44 @@ class TestNumericalSafety:
     def test_extreme_probabilities_clipped(self) -> None:
         """A prior of 0.999 in the lookup should still produce a finite logit."""
         predictor = ColdStartLookupPredictor(
-            sbc={}, sb={}, subj={"X": 0.999}, bench={"B": 0.001},
-            global_mean=0.5, name_aliases={}, name_lc={"x": "X"},
+            sbc={},
+            sb={},
+            subj={"X": 0.999},
+            bench={"B": 0.001},
+            global_mean=0.5,
+            name_aliases={},
+            name_lc={"x": "X"},
         )
         # Level 3 IRT blend: logit(0.999) + logit(0.001) - logit(0.5).
         # The two extremes nearly cancel and the result is close to 0.5.
-        p = predictor.predict({"benchmark": "B", "condition": "none",
-                               "subject_content": "Name: X", "item_content": ""})
+        p = predictor.predict({"benchmark": "B", "condition": "none", "subject_content": "Name: X", "item_content": ""})
         assert math.isfinite(p)
         assert 0.0 < p < 1.0
 
     def test_empty_input_returns_global(self) -> None:
         predictor = ColdStartLookupPredictor(
-            sbc={}, sb={}, subj={}, bench={}, global_mean=0.42,
-            name_aliases={}, name_lc={},
+            sbc={},
+            sb={},
+            subj={},
+            bench={},
+            global_mean=0.42,
+            name_aliases={},
+            name_lc={},
         )
-        p = predictor.predict({"benchmark": "", "condition": "",
-                               "subject_content": "", "item_content": ""})
+        p = predictor.predict({"benchmark": "", "condition": "", "subject_content": "", "item_content": ""})
         assert abs(p - 0.42) < 1e-6
 
     def test_output_clipping_respected(self) -> None:
         """Output clip should bound predictions even when lookup returns 1.0."""
         predictor = ColdStartLookupPredictor(
-            sbc={"x||b||none": 1.0}, sb={}, subj={}, bench={},
-            global_mean=0.5, name_aliases={}, name_lc={"x": "x"},
+            sbc={"x||b||none": 1.0},
+            sb={},
+            subj={},
+            bench={},
+            global_mean=0.5,
+            name_aliases={},
+            name_lc={"x": "x"},
             output_clip=(0.05, 0.95),
         )
-        p = predictor.predict({"benchmark": "b", "condition": "none",
-                               "subject_content": "Name: x", "item_content": ""})
+        p = predictor.predict({"benchmark": "b", "condition": "none", "subject_content": "Name: x", "item_content": ""})
         assert p == 0.95

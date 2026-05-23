@@ -58,9 +58,7 @@ def test_fit_base_logit_platt_caches_across_repeated_calls():
     labeled = _labeled()
     p1 = model._fit_base_logit_platt(labeled, counting)
     first_calls = counter["n"]
-    assert first_calls == len(labeled), (
-        f"expected {len(labeled)} base calls on cold cache, got {first_calls}"
-    )
+    assert first_calls == len(labeled), f"expected {len(labeled)} base calls on cold cache, got {first_calls}"
 
     p2 = model._fit_base_logit_platt(labeled, counting)
     second_calls = counter["n"] - first_calls
@@ -87,9 +85,7 @@ def test_fit_base_logit_platt_cache_misses_when_labeled_length_changes():
 
     model._fit_base_logit_platt(long_, counting)
     after_long = counter["n"] - after_short
-    assert after_long == len(long_), (
-        f"different labeled length should invalidate cache; got {after_long} new calls"
-    )
+    assert after_long == len(long_), f"different labeled length should invalidate cache; got {after_long} new calls"
 
 
 def test_initialize_runtime_resets_platt_cache(tmp_path, monkeypatch):
@@ -173,6 +169,4 @@ def test_initialize_runtime_resets_platt_cache(tmp_path, monkeypatch):
     counter["n"] = 0
     model._fit_base_logit_platt(labeled, counting)
     after_reset = counter["n"]
-    assert after_reset == len(labeled), (
-        f"_initialize_runtime did not clear the Platt cache; got {after_reset} calls"
-    )
+    assert after_reset == len(labeled), f"_initialize_runtime did not clear the Platt cache; got {after_reset} calls"

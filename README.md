@@ -24,6 +24,15 @@ uv pip install torch_measure        # into the active environment
 uv add torch_measure                # into a uv-managed project
 ```
 
+## Codabench submission scaffolding (CS321M)
+
+The [`submission/`](submission/README.md) directory ships a CAIMIRA + EB
+hybrid Codabench-ready entry point for the CS321M Predictive AI Evaluation
+Challenge (competition 15934), plus a Modal-backed remote-training wrapper
+([`modal_train.py`](modal_train.py)) that produces deployable artifacts
+on a GPU. See `submission/README.md` for the full Run flow, including
+local + Modal training variants.
+
 ## Contributing
 
 We welcome contributions! Please see our [contributing guidelines](CONTRIBUTING.md) for details, or drop by our [Discord](https://discord.gg/F6xbEwvvhb) to chat.

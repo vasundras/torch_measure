@@ -2,6 +2,11 @@
 
 """1-PL IRT with LLM-augmented item difficulty (experimental).
 
+Located in ``torch_measure.experimental`` rather than ``torch_measure.models``
+per the 2026-05-22 API-hygiene patch (PR #2 v2 Lane C): the module's
+documented ``Negative-result disclosure`` makes it ineligible for the
+supported public model surface.
+
 This module implements the M4.5 architecture explored in the Stanford
 CS321M Predictive AI Evaluation Challenge. The model formulation is::
 
@@ -39,8 +44,8 @@ for the full narrative.
 from __future__ import annotations
 
 import math
-from collections.abc import Sequence
-from typing import Any, Callable
+from collections.abc import Callable, Sequence
+from typing import Any
 
 from torch_measure.models.cold_start_lookup import (
     ColdStartLookupPredictor,
@@ -62,6 +67,20 @@ def build_difficulty_prompt(
     item difficulty, deliberately without mentioning any specific
     subject. The judge is rating the item, not predicting subject
     behaviour, which is a measurable competence at this scale.
+
+    Examples
+    --------
+    >>> prompt = build_difficulty_prompt("What is 2 + 2?", "mmlupro")
+    >>> "benchmark `mmlupro`" in prompt
+    True
+    >>> "What is 2 + 2?" in prompt
+    True
+    >>> prompt.endswith("Answer:")
+    True
+    >>> # Long inputs are truncated to ``max_item_chars``.
+    >>> long_prompt = build_difficulty_prompt("x" * 5000, "mmlupro", max_item_chars=100)
+    >>> long_prompt.count("x")
+    100
     """
     item = (item_content or "")[:max_item_chars]
     return (
@@ -104,6 +123,28 @@ class LLMJudgeIRT:
     -----
     See module docstring for the negative-result disclosure. Production
     code should prefer :class:`ColdStartLookupPredictor` directly.
+
+    Examples
+    --------
+    >>> # Construct with a minimal in-memory lookup table and a stub judge.
+    >>> from torch_measure.models.cold_start_lookup import ColdStartLookupPredictor
+    >>> lookup = ColdStartLookupPredictor(
+    ...     sbc={},
+    ...     sb={},
+    ...     subj={"gpt-4": 0.8},
+    ...     bench={"mmlupro": 0.6},
+    ...     global_mean=0.5,
+    ... )
+    >>> judge = lambda item, bench: 0.0  # neutral judge -> falls back to theta
+    >>> model = LLMJudgeIRT(lookup, judge_fn=judge, alpha=0.5, beta=0.0)
+    >>> p = model.predict({
+    ...     "subject_content": "Name: gpt-4",
+    ...     "benchmark": "mmlupro",
+    ...     "condition": "none",
+    ...     "item_content": "What is the capital of France?",
+    ... })
+    >>> 0.02 <= p <= 0.98
+    True
     """
 
     def __init__(
@@ -136,7 +177,7 @@ class LLMJudgeIRT:
             self.lookup.name_aliases,
             self.lookup.name_lc,
         )
-        p_lookup = self.lookup._lookup_p(subj_name, benchmark, condition)
+        p_lookup = self.lookup.lookup_p(subj_name, benchmark, condition)
         theta = _logit(p_lookup)
 
         try:
@@ -188,10 +229,7 @@ class LLMJudgeIRT:
             import numpy as np
             from scipy.optimize import minimize
         except ImportError as e:
-            raise ImportError(
-                "fit_alpha_beta requires scipy and numpy. "
-                "Install with `pip install scipy numpy`."
-            ) from e
+            raise ImportError("fit_alpha_beta requires scipy and numpy. Install with `pip install scipy numpy`.") from e
 
         theta_arr = np.asarray(thetas, dtype=float)
         jl_arr = np.asarray(judge_logits, dtype=float)

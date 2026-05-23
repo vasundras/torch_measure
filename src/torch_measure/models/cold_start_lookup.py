@@ -46,9 +46,20 @@ from typing import Any
 # Provider prefixes that subjects sometimes appear with in subject_content
 # but not in display_name (e.g. "meta-llama/Llama-2-7b-chat" vs "Llama-2-7b-chat").
 _DEFAULT_PROVIDER_PREFIXES: tuple[str, ...] = (
-    "meta-llama/", "openai/", "mistralai/", "google/", "anthropic/",
-    "microsoft/", "huggingface/", "tiiuae/", "deepmind/", "cohere/",
-    "allenai/", "01-ai/", "qwen/", "baichuan-inc/",
+    "meta-llama/",
+    "openai/",
+    "mistralai/",
+    "google/",
+    "anthropic/",
+    "microsoft/",
+    "huggingface/",
+    "tiiuae/",
+    "deepmind/",
+    "cohere/",
+    "allenai/",
+    "01-ai/",
+    "qwen/",
+    "baichuan-inc/",
 )
 
 # Default probability clipping. Avoids inf in logit() and keeps NLL bounded.
@@ -101,7 +112,10 @@ def parse_subject_name(subject_content: str) -> str:
         return ""
     m = re.match(r"\s*Name:\s*(.+)", subject_content)
     if m:
-        return m.group(1).strip().splitlines()[0].strip()
+        lines = m.group(1).strip().splitlines()
+        if lines:
+            return lines[0].strip()
+        return ""
     return subject_content.split("\n", 1)[0].strip()
 
 
@@ -146,7 +160,7 @@ def resolve_subject_name(
     raw_lower = raw_name.lower()
     for prefix in provider_prefixes:
         if raw_lower.startswith(prefix):
-            candidates.append(raw_name[len(prefix):].strip())
+            candidates.append(raw_name[len(prefix) :].strip())
             break
 
     for cand in candidates:
@@ -245,8 +259,11 @@ class ColdStartLookupPredictor:
 
         # Per-benchmark Platt calibration state. Populated by ``calibrate``.
         # Each entry is ``(slope, intercept)``; slope is fixed at 1.0 by design.
+        # No ``_platt_fit_key`` cache: the prior ``len(labeled)``-key cache was
+        # removed because library callers may pass distinct labeled lists of
+        # equal length within one process. The Codabench-only equivalent
+        # lives in ``submission/model.py:_fit_base_logit_platt``.
         self._platt: dict[str, tuple[float, float]] = {}
-        self._platt_fit_key: int = -1
 
     # ---- Persistence -----------------------------------------------------
 
@@ -291,7 +308,7 @@ class ColdStartLookupPredictor:
 
     # ---- Core lookup -----------------------------------------------------
 
-    def _lookup_p(self, subj_name: str, benchmark: str, condition: str) -> float:
+    def lookup_p(self, subj_name: str, benchmark: str, condition: str) -> float:
         """Walk the 6-level fallback hierarchy and return the first match.
 
         Levels (each tried case-insensitively as a fallback within the level):
@@ -379,10 +396,14 @@ class ColdStartLookupPredictor:
 
         raw_name = parse_subject_name(subject_content)
         subj_name = resolve_subject_name(
-            raw_name, self.subj, self.sb, self.sbc,
-            self.name_aliases, self.name_lc,
+            raw_name,
+            self.subj,
+            self.sb,
+            self.sbc,
+            self.name_aliases,
+            self.name_lc,
         )
-        p = self._lookup_p(subj_name, benchmark, condition)
+        p = self.lookup_p(subj_name, benchmark, condition)
 
         if labeled:
             self.calibrate(labeled)
@@ -398,12 +419,17 @@ class ColdStartLookupPredictor:
         records: list[dict[str, Any]],
         labeled: list[dict[str, Any]] | None = None,
     ) -> list[float]:
-        """Vectorised wrapper around ``predict``. Calibration is fit once
-        (cached by ``len(labeled)`` inside :meth:`calibrate`) and applied
-        to every record. The earlier implementation called ``calibrate``
-        here but then invoked ``self.predict(r)`` without forwarding
-        ``labeled``, so the ``if labeled:`` guard inside :meth:`predict`
-        was always false and the calibration was never applied.
+        """Vectorised wrapper around ``predict``. The earlier implementation
+        called ``calibrate`` here but then invoked ``self.predict(r)``
+        without forwarding ``labeled``, so the ``if labeled:`` guard inside
+        :meth:`predict` was always false and the calibration was never
+        applied; forwarding ``labeled`` to each ``predict`` call restores
+        the intended calibration. :meth:`calibrate` is NOT cached, so each
+        per-record ``predict`` invocation refits Platt; for very large
+        batches that have noticeable refit cost, hoist the ``calibrate``
+        + Platt-apply loop out of :meth:`predict_batch` rather than
+        reintroducing a ``len(labeled)``-key cache (see the docstring of
+        :meth:`calibrate` for why that cache was removed).
         """
         return [self.predict(r, labeled=labeled) for r in records]
 
@@ -424,13 +450,14 @@ class ColdStartLookupPredictor:
         benchmark's labeled distribution to another benchmark introduces
         more noise than signal at this K.
 
-        This method is idempotent if called with the same labeled list
-        (cached by length).
+        No caching by ``len(labeled)``: the Codabench-only ``len(labeled)``
+        cache pattern (see ``submission/model.py:_fit_base_logit_platt``)
+        is intentionally NOT used here because library callers may pass
+        distinct ``labeled`` lists of equal length within one process, and
+        a length-key cache would silently return stale shifts for the
+        second call. Every call clears ``self._platt`` and recomputes
+        from scratch.
         """
-        new_key = len(labeled)
-        if new_key == self._platt_fit_key:
-            return
-        self._platt_fit_key = new_key
         self._platt.clear()
 
         by_bench: dict[str, list[tuple[float, float]]] = {}
@@ -442,14 +469,18 @@ class ColdStartLookupPredictor:
             subject_content = ex.get("subject_content", "") or ""
             raw_name = parse_subject_name(subject_content)
             subj_name = resolve_subject_name(
-                raw_name, self.subj, self.sb, self.sbc,
-                self.name_aliases, self.name_lc,
+                raw_name,
+                self.subj,
+                self.sb,
+                self.sbc,
+                self.name_aliases,
+                self.name_lc,
             )
             try:
                 label = float(ex["label"])
             except (TypeError, ValueError):
                 continue
-            p = self._lookup_p(subj_name, bench, cond)
+            p = self.lookup_p(subj_name, bench, cond)
             by_bench.setdefault(bench, []).append((_logit(p), label))
 
         for bench, pairs in by_bench.items():

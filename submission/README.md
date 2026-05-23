@@ -33,6 +33,23 @@ submission/
 └── eb_tables.json           # 6-level EB hierarchy + name lookup tables
 ```
 
+## Prerequisites
+
+This scaffolding assumes a parent CS321M directory layout (see the team's
+operator-facing `CLAUDE.md` for the canonical reference). Required sibling
+repositories alongside this fork:
+
+* `../starting_kit/` — the Codabench-supplied starting kit. Steps 3-4 of the
+  Run flow invoke `../starting_kit/tools/check_submission_zip.py` and
+  `../starting_kit/tools/run_smoke_test.py` from that directory.
+* `../predictive-eval-competition/` — the team's CS321M working repo. Step
+  5 of the Run flow invokes `../predictive-eval-competition/scripts/run_d9_gate.py`
+  to run the pre-submission transfer-audit gate.
+
+Without these siblings present, steps 3-5 of the Run flow are NOT executable
+from this fork alone — they are documented here as part of the canonical
+operator flow, not as self-contained reproducibles.
+
 ## How it differs from the team's reference flow
 
 The `predictive-eval-competition` repo at
@@ -68,6 +85,14 @@ python submission/train.py --smoke
 #    Full run (all binary benchmarks, default 200 epochs, ~hours on CPU):
 python submission/train.py
 
+# 1b. (Alternate) Remote training via Modal for GPU acceleration.
+#     See the "Remote training via Modal" section below for setup.
+#     Smoke (plumbing check, ~5 epochs):
+modal run modal_train.py::main --kind smoke --latent-dim 5 --seed 42 --epochs 5
+#     Full training (CAIMIRA m=5, 100 epochs, --skip-pull to keep artifacts
+#     remote-only):
+modal run modal_train.py::main --kind train --latent-dim 5 --seed 7 --epochs 100
+
 # 2. Package a flat ZIP (writes submission_caimira.zip at the repo root).
 bash submission/build_zip.sh
 
@@ -82,11 +107,55 @@ python ../starting_kit/tools/run_smoke_test.py submission/
 
 # 5. Run the D-9 pre-submission transfer-audit gate before upload.
 #    (Lives in the parent repo; runs the four-sub-gate audit on a held-out
-#    benchmark before consuming Codabench quota.)
-python ../predictive-eval-competition/scripts/run_d9_gate.py submission_caimira.zip
+#    benchmark before consuming Codabench quota. The signature requires
+#    three named arguments per the script's argparse block — see
+#    `../predictive-eval-competition/scripts/run_d9_gate.py:64-66`.)
+python ../predictive-eval-competition/scripts/run_d9_gate.py \
+    --candidate submission_caimira.zip \
+    --name caimira \
+    --out runs/d9/caimira_gate_result.json
 
 # 6. Upload to Codabench competition 15934 only after D-9 passes.
 ```
+
+## Remote training via Modal
+
+`modal_train.py` (at the repo root) is an artifact-only Modal wrapper around
+`submission/train.py`. It produces `caimira_lite.pt`, `caimira_lite.meta.json`,
+and `eb_tables.json` under `runs/modal/<run_id>/` (mirrored from a Modal
+Volume named `torch-measure-caimira-artifacts`). The wrapper REFUSES to start
+if any `*codabench*` env vars are present in the local environment — this
+lane is strictly artifact production, not submission.
+
+### Modal setup
+
+```bash
+# One-time, on either Device 1 (Mac) or Device 2 (Win11 + RTX 5090).
+pip install modal
+modal setup                    # or: modal token new
+```
+
+The wrapper requests an H100 / A100-80GB / L40S GPU (in that fallback order)
+and persists artifacts in the Modal Volume `torch-measure-caimira-artifacts`,
+which is mirrored locally on `--skip-pull=false` (the default).
+
+### Usage
+
+```bash
+# Plumbing-only smoke check (5-epoch single-benchmark train + artifact pull):
+modal run modal_train.py::main --kind smoke --latent-dim 5 --seed 42 --epochs 5
+
+# Full training run with explicit Platt blend lambdas for D-9 ablation:
+modal run modal_train.py::main --kind train --latent-dim 5 --seed 7 \
+    --epochs 100 --blend-lambdas 0.3,0.5,0.6,0.7,0.9
+
+# Dry-run plan emission (prints JSON, performs no Modal call):
+python modal_train.py --kind train --latent-dim 5 --seed 7 --epochs 100 --dry-run
+```
+
+Pulled artifacts land at `runs/modal/<run_id>/`. Pass `--skip-pull` to keep
+the artifacts only on the Modal Volume (useful for very large multi-seed
+sweeps where local disk pressure matters).
 
 ## Cold-start strategy
 

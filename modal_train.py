@@ -53,7 +53,12 @@ def utc_now() -> str:
 
 def validate_run_id(run_id: str) -> str:
     # SECURITY-REVIEW: run IDs become local and Modal Volume paths, so reject
-    # separators/traversal and keep the alphabet narrow.
+    # separators/traversal and keep the alphabet narrow. Bare ``.`` and ``..``
+    # are explicitly rejected because the regex below admits them (they pass
+    # ``[A-Za-z0-9_.-]+`` since ``.`` is in the alphabet) but they resolve to
+    # the parent / current directory rather than producing a new artifact tree.
+    if run_id in {".", ".."}:
+        raise ValueError(f"unsafe run_id: {run_id!r}")
     if not run_id or not RUN_ID_RE.fullmatch(run_id) or "/" in run_id or ".." in run_id:
         raise ValueError(f"unsafe run_id: {run_id!r}")
     return run_id
@@ -61,11 +66,7 @@ def validate_run_id(run_id: str) -> str:
 
 def assert_no_codabench_capability() -> None:
     """Refuse to run if Codabench credentials are visible in the environment."""
-    leaked = [
-        name
-        for name, value in os.environ.items()
-        if value and FORBIDDEN_ENV_RE.search(name)
-    ]
+    leaked = [name for name, value in os.environ.items() if value and FORBIDDEN_ENV_RE.search(name)]
     if leaked:
         raise RuntimeError(
             "modal_train.py refuses to start with Codabench-related env vars "
@@ -74,8 +75,13 @@ def assert_no_codabench_capability() -> None:
 
 
 def default_run_id(kind: str, latent_dim: int, seed: int, epochs: int) -> str:
+    # Append 4-char hex suffix (~1/65k collision probability per same-second
+    # invocation) so back-to-back smoke runs don't clobber each other's
+    # ``runs/modal/<run_id>/`` tree. Underscore-separated to remain inside
+    # the ``RUN_ID_RE = ^[A-Za-z0-9_.-]+$`` alphabet.
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    return f"modal_light_caimira_m{latent_dim}_seed{seed}_ep{epochs}_{kind}_{stamp}"
+    suffix = os.urandom(2).hex()
+    return f"modal_light_caimira_m{latent_dim}_seed{seed}_ep{epochs}_{kind}_{stamp}_{suffix}"
 
 
 def _resolve_smoke_and_epochs(kind: str, smoke: bool, epochs: int) -> tuple[bool, int]:
@@ -348,7 +354,7 @@ def pull_volume_tree(run_id: str, local_root: Path = LOCAL_ARTIFACT_ROOT) -> int
             entry_parts = Path(str(entry.path).lstrip("/")).parts
             prefix_parts = Path(run_id).parts
             if entry_parts[: len(prefix_parts)] == prefix_parts:
-                rel = Path(*entry_parts[len(prefix_parts):])
+                rel = Path(*entry_parts[len(prefix_parts) :])
             else:
                 rel = Path(entry_parts[-1])
             target = local_dir / rel
@@ -430,6 +436,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--smoke", action="store_true")
     parser.add_argument("--benchmarks", default="")
     parser.add_argument("--blend-lambdas", default="0.0,0.5,0.6,0.9,1.0")
+    parser.add_argument(
+        "--skip-pull",
+        action="store_true",
+        help=(
+            "Don't pull artifacts from the Modal Volume after training. "
+            "Local CLI only emits this in the dry-run plan; the actual "
+            "skip-pull behaviour is honored by ``modal run modal_train.py::main "
+            "--skip-pull`` (the Modal entrypoint)."
+        ),
+    )
     parser.add_argument("--dry-run", action="store_true")
     return parser
 
@@ -450,6 +466,7 @@ def cli(argv: list[str] | None = None) -> int:
         "smoke": smoke,
         "benchmarks": [part for part in args.benchmarks.split(",") if part],
         "blend_lambdas": [float(part) for part in args.blend_lambdas.split(",") if part],
+        "skip_pull": args.skip_pull,
         "modal_available": modal is not None,
         "codabench_submission_allowed": False,
     }

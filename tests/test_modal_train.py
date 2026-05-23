@@ -15,6 +15,7 @@ resolution to: ``kind="smoke"`` forces ``smoke=True`` and caps epochs at 5;
 from __future__ import annotations
 
 import importlib
+import importlib.util
 import inspect
 import io
 import json
@@ -58,7 +59,9 @@ def test_cli_train_kind_does_not_force_smoke(modal_train):
     with redirect_stdout(buf):
         rc = modal_train.cli(["--kind", "train", "--epochs", "100", "--dry-run"])
     assert rc == 0
-    plan = json.loads(buf.getvalue().splitlines()[0] if "{" not in buf.getvalue()[0] else buf.getvalue().split("Local CLI")[0])
+    plan = json.loads(
+        buf.getvalue().splitlines()[0] if "{" not in buf.getvalue()[0] else buf.getvalue().split("Local CLI")[0]
+    )
     assert plan["kind"] == "train"
     assert plan["smoke"] is False
     assert plan["epochs"] == 100

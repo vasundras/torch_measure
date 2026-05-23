@@ -14,7 +14,6 @@ from torch_measure.models.caimira import CAIMIRA
 from torch_measure.models.cold_start_lookup import ColdStartLookupPredictor
 from torch_measure.models.ggm import GaussianGraphicalModel
 from torch_measure.models.ising import IsingModel
-from torch_measure.models.llm_judge_irt import LLMJudgeIRT, build_difficulty_prompt
 from torch_measure.models.logistic_fm import LogisticFM
 from torch_measure.models.multifacet import MultiFacetRasch
 from torch_measure.models.multifacet_twopl import MultiFacet2PL
@@ -36,8 +35,6 @@ __all__ = [
     "GaussianGraphicalModel",
     "BradleyTerry",
     "ColdStartLookupPredictor",
-    "LLMJudgeIRT",
-    "build_difficulty_prompt",
     "Rasch",
     "TwoPL",
     "ThreePL",
@@ -57,3 +54,32 @@ __all__ = [
     "bifactor_rotation",
     "NCF",
 ]
+
+
+# ---- Backward-compat shim (2026-05-22 PR #2 v2 Lane C) ----------------------
+#
+# LLMJudgeIRT and build_difficulty_prompt were moved from
+# ``torch_measure.models`` to ``torch_measure.experimental`` because the
+# module documents a convergent negative result (see
+# ``torch_measure/experimental/llm_judge_irt.py`` module docstring). The
+# names below are intentionally NOT in ``__all__`` and not eagerly imported,
+# so wildcard imports and Sphinx autodoc no longer surface them. PEP 562
+# module ``__getattr__`` resolves them on demand with a single
+# DeprecationWarning so existing call sites (notably
+# ``tests/test_submission/test_nan_safety.py``) keep working until they
+# migrate. Remove this shim in a future release.
+def __getattr__(name):
+    if name in {"LLMJudgeIRT", "build_difficulty_prompt"}:
+        import warnings
+
+        warnings.warn(
+            f"{name} has moved to torch_measure.experimental; "
+            "import from torch_measure.experimental instead. "
+            "The shim in torch_measure.models will be removed in a future release.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        from torch_measure.experimental import llm_judge_irt
+
+        return getattr(llm_judge_irt, name)
+    raise AttributeError(f"module 'torch_measure.models' has no attribute {name!r}")

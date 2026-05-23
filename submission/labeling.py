@@ -177,10 +177,13 @@ def _update_reservoir(signature: int, candidate_key: str) -> None:
         _seen_signatures.append(signature)
         return
 
-    slot = _hash_u64(
-        f"{candidate_key}\n{_candidate_count}",
-        person=b"reservoir-v1",
-    ) % _candidate_count
+    slot = (
+        _hash_u64(
+            f"{candidate_key}\n{_candidate_count}",
+            person=b"reservoir-v1",
+        )
+        % _candidate_count
+    )
     if slot < _MAX_SEEN:
         _seen_signatures[slot] = signature
 

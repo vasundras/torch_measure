@@ -2,7 +2,7 @@
 
 """Regression test for the level-3 IRT-blend or-chain on 0.0 priors.
 
-Both ``cold_start_lookup.ColdStartLookupPredictor._lookup_p`` and
+Both ``cold_start_lookup.ColdStartLookupPredictor.lookup_p`` and
 ``caimira_lite.EBLookup.lookup_p`` build ``subj_p`` / ``bench_p`` via
 ``self.X.get(key) or self._X_ci.get(key.lower())``. If ``self.X.get`` returns
 a legitimate ``0.0`` prior, the ``or`` short-circuits to the case-insensitive
@@ -51,7 +51,7 @@ def test_cold_start_zero_subj_prior_not_overridden_by_ci_view():
     )
     _force_ci_divergence(pred, subj_key="gpt-4", subj_ci_value=0.9)
     # Level 5: subject-only path. With the or-chain bug, `0.0 or 0.9` == 0.9.
-    p = pred._lookup_p("gpt-4", "unknown_bench", "x")
+    p = pred.lookup_p("gpt-4", "unknown_bench", "x")
     assert p == 0.0
 
 
@@ -68,7 +68,7 @@ def test_cold_start_zero_bench_prior_not_overridden_by_ci_view():
         name_lc={},
     )
     _force_ci_divergence(pred, bench_key="mmlupro", bench_ci_value=0.9)
-    p = pred._lookup_p("unknown_subject", "mmlupro", "x")
+    p = pred.lookup_p("unknown_subject", "mmlupro", "x")
     assert p == 0.0
 
 
@@ -91,7 +91,7 @@ def test_cold_start_zero_priors_in_irt_blend_not_overridden_by_ci_view():
         bench_key="mmlupro",
         bench_ci_value=0.9,
     )
-    p = pred._lookup_p("gpt-4", "mmlupro", "x")
+    p = pred.lookup_p("gpt-4", "mmlupro", "x")
     # With the or-chain bug, level 3 fires with (0.9, 0.9, 0.5) → ~0.92.
     # With the fix, level 3 fires with (0.0, 0.0, 0.5), which after the
     # _logit guard clips both 0.0 inputs and produces a tiny blended value
@@ -111,7 +111,7 @@ def test_cold_start_none_condition_triple_uses_ci_view():
         name_aliases={},
         name_lc={},
     )
-    p = pred._lookup_p("GPT-4", "MMLUPRO", "cot")
+    p = pred.lookup_p("GPT-4", "MMLUPRO", "cot")
     assert p == 0.9
 
 

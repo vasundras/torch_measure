@@ -10,16 +10,11 @@ parameter fitting, and graceful-failure semantics.
 from __future__ import annotations
 
 import math
-import re
 
 import pytest
 
-from torch_measure.models import (
-    ColdStartLookupPredictor,
-    LLMJudgeIRT,
-    build_difficulty_prompt,
-)
-
+from torch_measure.experimental import LLMJudgeIRT, build_difficulty_prompt
+from torch_measure.models import ColdStartLookupPredictor
 
 # ---- Fixtures ---------------------------------------------------------------
 
@@ -28,11 +23,13 @@ from torch_measure.models import (
 def minimal_lookup() -> ColdStartLookupPredictor:
     """A tiny lookup that always falls through to a level-3 IRT blend."""
     return ColdStartLookupPredictor(
-        sbc={}, sb={},
+        sbc={},
+        sb={},
         subj={"gpt-4": 0.75, "claude-3": 0.70, "llama-2-7b": 0.35},
         bench={"mmlupro": 0.50, "cybench": 0.25, "ai2d_test": 0.70},
         global_mean=0.645,
-        name_aliases={}, name_lc={"gpt-4": "gpt-4", "claude-3": "claude-3"},
+        name_aliases={},
+        name_lc={"gpt-4": "gpt-4", "claude-3": "claude-3"},
     )
 
 
@@ -71,10 +68,9 @@ class TestDifficultyPrompt:
 
 
 class TestPredict:
-    def test_alpha_zero_recovers_lookup_logit(
-        self, minimal_lookup: ColdStartLookupPredictor
-    ) -> None:
+    def test_alpha_zero_recovers_lookup_logit(self, minimal_lookup: ColdStartLookupPredictor) -> None:
         """alpha=0, beta=0 -> predict matches sigmoid(logit(lookup)). Should equal lookup."""
+
         def constant_judge(item: str, bench: str) -> float:
             return 7.5  # any value -- multiplied by zero anyway
 
@@ -94,10 +90,9 @@ class TestPredict:
         p_lookup = minimal_lookup.predict(record)
         assert abs(p_irt - p_lookup) < 1e-6
 
-    def test_positive_alpha_with_hard_judge_lowers_prediction(
-        self, minimal_lookup: ColdStartLookupPredictor
-    ) -> None:
+    def test_positive_alpha_with_hard_judge_lowers_prediction(self, minimal_lookup: ColdStartLookupPredictor) -> None:
         """alpha>0 and judge says yes (hard) -> delta>0 -> P(correct) decreases."""
+
         def hard_judge(item: str, bench: str) -> float:
             return 1.0  # yes > no
 
@@ -117,9 +112,7 @@ class TestPredict:
         p_lookup = minimal_lookup.predict(record)
         assert p_irt < p_lookup
 
-    def test_positive_alpha_with_easy_judge_raises_prediction(
-        self, minimal_lookup: ColdStartLookupPredictor
-    ) -> None:
+    def test_positive_alpha_with_easy_judge_raises_prediction(self, minimal_lookup: ColdStartLookupPredictor) -> None:
         def easy_judge(item: str, bench: str) -> float:
             return -1.0  # no > yes -> easy
 
@@ -139,10 +132,9 @@ class TestPredict:
         p_lookup = minimal_lookup.predict(record)
         assert p_irt > p_lookup
 
-    def test_judge_exception_handled_gracefully(
-        self, minimal_lookup: ColdStartLookupPredictor
-    ) -> None:
+    def test_judge_exception_handled_gracefully(self, minimal_lookup: ColdStartLookupPredictor) -> None:
         """A raised exception from the judge should degrade to the lookup value."""
+
         def broken_judge(item: str, bench: str) -> float:
             raise RuntimeError("simulated judge failure")
 
@@ -163,10 +155,9 @@ class TestPredict:
         # judge_logit collapses to 0 -> delta=0 -> recover lookup.
         assert abs(p_irt - p_lookup) < 1e-6
 
-    def test_logit_cap_bounds_extreme_outputs(
-        self, minimal_lookup: ColdStartLookupPredictor
-    ) -> None:
+    def test_logit_cap_bounds_extreme_outputs(self, minimal_lookup: ColdStartLookupPredictor) -> None:
         """Even with extreme judge logits, output stays inside output_clip."""
+
         def extreme_judge(item: str, bench: str) -> float:
             return 100.0
 
@@ -195,7 +186,7 @@ class TestPredict:
 class TestFitAlphaBeta:
     def test_zero_signal_yields_near_zero_alpha(self) -> None:
         """If judge_logits have no relationship with labels, alpha shrinks toward 0."""
-        scipy = pytest.importorskip("scipy")
+        pytest.importorskip("scipy")
         import numpy as np  # noqa: F401
 
         rng_thetas = [0.0] * 200
@@ -203,13 +194,16 @@ class TestFitAlphaBeta:
         # Labels uncorrelated with jl.
         rng_labels = [i % 2 for i in range(200)]
         alpha, beta, _ = LLMJudgeIRT.fit_alpha_beta(
-            rng_thetas, rng_jl, rng_labels, l2_penalty=2.0,
+            rng_thetas,
+            rng_jl,
+            rng_labels,
+            l2_penalty=2.0,
         )
         assert abs(alpha) < 0.2, f"alpha should be near 0 for noise, got {alpha}"
 
     def test_strong_signal_recovers_alpha_sign(self) -> None:
         """With a clean positive signal, the fitted alpha should be > 0."""
-        scipy = pytest.importorskip("scipy")
+        pytest.importorskip("scipy")
 
         # Construct a dataset where higher judge_logit -> lower label probability,
         # which under the IRT formula P = sigmoid(theta - alpha*jl - beta) implies
@@ -225,13 +219,16 @@ class TestFitAlphaBeta:
             judge_logits.append(jl)
             labels.append(1 if p_true > 0.5 else 0)
         alpha, beta, _ = LLMJudgeIRT.fit_alpha_beta(
-            thetas, judge_logits, labels, l2_penalty=0.0,
+            thetas,
+            judge_logits,
+            labels,
+            l2_penalty=0.0,
         )
         assert alpha > 0.5, f"alpha should clearly be positive, got {alpha}"
 
     def test_l2_penalty_shrinks_alpha(self) -> None:
         """Increasing L2 penalty should shrink the absolute value of alpha."""
-        scipy = pytest.importorskip("scipy")
+        pytest.importorskip("scipy")
 
         n = 100
         thetas = [0.0] * n
@@ -239,9 +236,15 @@ class TestFitAlphaBeta:
         labels = [1 if jl < 0 else 0 for jl in judge_logits]
 
         alpha_no_l2, _, _ = LLMJudgeIRT.fit_alpha_beta(
-            thetas, judge_logits, labels, l2_penalty=0.0,
+            thetas,
+            judge_logits,
+            labels,
+            l2_penalty=0.0,
         )
         alpha_strong_l2, _, _ = LLMJudgeIRT.fit_alpha_beta(
-            thetas, judge_logits, labels, l2_penalty=100.0,
+            thetas,
+            judge_logits,
+            labels,
+            l2_penalty=100.0,
         )
         assert abs(alpha_strong_l2) < abs(alpha_no_l2)

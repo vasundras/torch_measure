@@ -16,6 +16,8 @@ Question Answering with CAIMIRA." EMNLP 2024. arXiv:2410.06524.
 
 from __future__ import annotations
 
+from typing import Literal
+
 import torch
 from torch import nn
 
@@ -165,7 +167,7 @@ class CAIMIRA(IRTModel):
     def compute_item_params(
         self,
         embeddings: torch.Tensor | None = None,
-        center: str = "auto",
+        center: Literal["auto", "dynamic", "frozen"] = "auto",
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Compute ``(relevance, difficulty)`` for a batch of item embeddings.
 
@@ -264,11 +266,20 @@ class CAIMIRA(IRTModel):
         return torch.sigmoid(logit)
 
     def _refresh_difficulty_mean(self) -> None:
-        """Snapshot the current training-bank difficulty mean into the buffer."""
+        """Snapshot the current training-bank difficulty mean into the buffer.
+
+        ``self._embeddings`` is a plain Python attribute (not a registered
+        buffer), so ``model.to(device)`` does not carry it along. Without
+        the explicit ``.to(self._parameter_device())`` below, calling this
+        method after a ``model.to(...)`` would raise a cross-device
+        ``RuntimeError`` because ``difficulty_head`` lives on the new device
+        while ``self._embeddings`` still lives on the original one.
+        """
         if self._embeddings is None:
             raise RuntimeError("Cannot snapshot difficulty mean before set_embeddings().")
         with torch.no_grad():
-            d_raw = self.difficulty_head(self._embeddings)
+            embeddings = self._embeddings.to(self._parameter_device())
+            d_raw = self.difficulty_head(embeddings)
             self._difficulty_mean.copy_(d_raw.mean(dim=0))
 
     def predict(self, query: dict[str, torch.Tensor]) -> torch.Tensor:
@@ -308,6 +319,7 @@ class CAIMIRA(IRTModel):
         difficulty_reg: float = 1e-4,
         skill_reg: float = 1e-4,
         verbose: bool = True,
+        method: str = "mle",
         **kwargs,
     ) -> dict:
         r"""Fit CAIMIRA by MLE with L1 regularisation on difficulty and skill.
@@ -348,6 +360,11 @@ class CAIMIRA(IRTModel):
             L1 coefficient :math:`\lambda_s` on the subject skill matrix.
         verbose : bool
             Show a progress bar if ``tqdm`` is installed.
+        method : str, optional
+            Training algorithm. Only ``"mle"`` (the paper's MLE training,
+            using :func:`~torch_measure.fitting.mle.mle_fit` under the
+            hood) is supported. Any other value raises ``ValueError``.
+            Defaults to ``"mle"``.
         **kwargs
             Forwarded to :func:`~torch_measure.fitting.mle.mle_fit`
             (e.g. ``optimizer_cls``, ``convergence_tol``).
@@ -356,7 +373,19 @@ class CAIMIRA(IRTModel):
         -------
         dict
             Training history with ``"losses"`` key.
+
+        Raises
+        ------
+        ValueError
+            If ``method`` is not ``"mle"``. CAIMIRA does not implement EM
+            or other estimators; the explicit guard prevents silent fall-
+            through of an unknown ``method`` value into ``**kwargs``.
         """
+        if method != "mle":
+            raise ValueError(
+                f"CAIMIRA.fit only supports method='mle' (the paper's MLE training). Got method={method!r}."
+            )
+
         from torch_measure.fitting._losses import bernoulli_nll
         from torch_measure.fitting.mle import mle_fit
 

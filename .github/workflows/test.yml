@@ -34,7 +34,7 @@ jobs:
           pip install -e ".[test]"
 
       - name: Run tests
-        run: pytest tests/ -v --cov=torch_measure --cov-report=xml -m "not slow and not gpu"
+        run: pytest tests/ -v --cov=torch_measure --cov-report=xml -m "not slow and not gpu and not network"
 
       - name: Upload coverage
         if: matrix.python-version == '3.11'

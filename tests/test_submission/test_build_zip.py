@@ -59,9 +59,7 @@ def test_build_zip_smoke_produces_flat_allowlist(tmp_path):
     sub = _stage_submission(tmp_path)
     out_zip = tmp_path / "out.zip"
     result = _run_build_zip(sub, str(out_zip))
-    assert result.returncode == 0, (
-        f"build_zip.sh failed: stdout=\n{result.stdout}\nstderr=\n{result.stderr}"
-    )
+    assert result.returncode == 0, f"build_zip.sh failed: stdout=\n{result.stdout}\nstderr=\n{result.stderr}"
     assert out_zip.exists()
     with zipfile.ZipFile(out_zip) as zf:
         actual = sorted(zf.namelist())

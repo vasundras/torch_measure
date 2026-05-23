@@ -27,18 +27,25 @@ IRT Models
    :members:
    :undoc-members:
 
+See also :doc:`/examples/caimira_cold_start` for a worked example of
+scoring cold-start items with
+:meth:`~torch_measure.models.CAIMIRA.predict_embeddings`.
+
 Predictive Evaluation Models
 ----------------------------
+
+Experimental / negative-result predictive-evaluation models live in
+:mod:`torch_measure.experimental` -- see :doc:`experimental` for the
+rendered API page. The class below
+(:class:`~torch_measure.models.ColdStartLookupPredictor`) is fork-only
+infrastructure for the Stanford CS321M Predictive AI Evaluation
+Challenge (Codabench competition 15934); see
+``docs/SPLIT_MERGE_TARGETS.md`` for the upstream-eligible vs fork-only
+file split.
 
 .. autoclass:: torch_measure.models.ColdStartLookupPredictor
    :members:
    :undoc-members:
-
-.. autoclass:: torch_measure.models.LLMJudgeIRT
-   :members:
-   :undoc-members:
-
-.. autofunction:: torch_measure.models.build_difficulty_prompt
 
 .. autoclass:: torch_measure.models.TabPFNPredictor
    :members:

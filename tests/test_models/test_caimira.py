@@ -1,5 +1,6 @@
 # Copyright (c) 2026 AIMS Foundations. MIT License.
 
+import pytest
 import torch
 from torch import nn
 
@@ -215,3 +216,138 @@ class TestCAIMIRA:
         from torch_measure.models import CAIMIRA as ExportedCAIMIRA
 
         assert ExportedCAIMIRA is CAIMIRA
+
+
+class TestCAIMIRADeviceAndFitMethod:
+    """Regression tests for the Lane A patches.
+
+    Pin the contracts that emerged from the PR #2 v2 multi-wave code review:
+
+    * A1 — ``_refresh_difficulty_mean`` must move ``self._embeddings`` to
+      the parameter device before calling ``difficulty_head``. The
+      attribute is plain Python state, not a registered buffer, so
+      ``model.to(device)`` does not carry it along.
+    * A2 — ``predict`` must move CPU query indices to the parameter device.
+    * A3 — ``fit(method=...)`` must validate the algorithm name with a
+      clear ``ValueError`` rather than letting unknown values slip into
+      ``**kwargs`` and surface as a confusing ``TypeError`` from
+      ``mle_fit``.
+    * A4 — ``predict_embeddings`` with the default ``center='frozen'``
+      must equal the paper equation ``sigmoid((s - d) . r)`` after a
+      ``state_dict()`` round-trip.
+    """
+
+    def test_model_to_device_after_set_embeddings_refreshes_difficulty_mean(self):
+        """``model.to(device)`` then ``_refresh_difficulty_mean()`` must not
+        raise a cross-device ``RuntimeError``.
+
+        Regression test for A1: ``self._embeddings`` is a plain Python
+        attribute set by :meth:`CAIMIRA.set_embeddings`, NOT a buffer
+        registered via ``register_buffer``. PyTorch's ``model.to(device)``
+        only carries parameters and registered buffers, so without the
+        patched ``.to(self._parameter_device())`` inside
+        ``_refresh_difficulty_mean`` the embeddings would lag behind on
+        the original device after a ``model.to(...)`` call.
+
+        The CPU branch always runs and exercises the new ``.to()`` line.
+        The CUDA branch is the strongest cross-device assertion: it would
+        raise without the A1 fix.
+        """
+        torch.manual_seed(0)
+        model = CAIMIRA(n_subjects=3, n_items=5, embedding_dim=4, latent_dim=2)
+        model.set_embeddings(torch.randn(5, 4))
+        model.to("cpu")
+        model._refresh_difficulty_mean()
+        assert model._difficulty_mean.device.type == "cpu"
+        assert not torch.allclose(model._difficulty_mean, torch.zeros(2))
+
+        if torch.cuda.is_available():
+            torch.manual_seed(0)
+            cuda_model = CAIMIRA(n_subjects=3, n_items=5, embedding_dim=4, latent_dim=2)
+            cuda_model.set_embeddings(torch.randn(5, 4))
+            cuda_model.to("cuda")
+            cuda_model._refresh_difficulty_mean()
+            assert cuda_model._difficulty_mean.device.type == "cuda"
+
+    def test_predict_accepts_cpu_query_indices_after_model_to_device(self):
+        """``predict`` must move CPU-built query indices to the parameter device.
+
+        Regression test for A2: callers building tensors on CPU should
+        not need to know whether the model has been moved to CUDA. The
+        in-method ``device = self._parameter_device(); .to(device)`` calls
+        on ``query["subject_idx"]`` and ``query["item_idx"]`` are what
+        make ``predict`` device-agnostic for users.
+        """
+        torch.manual_seed(0)
+        model = CAIMIRA(n_subjects=4, n_items=6, embedding_dim=8, latent_dim=3)
+        model.set_embeddings(torch.randn(6, 8))
+        model.to("cpu")
+        query_cpu = {
+            "subject_idx": torch.tensor([0, 1, 2, 3], dtype=torch.long),
+            "item_idx": torch.tensor([0, 1, 2, 3], dtype=torch.long),
+        }
+        probs = model.predict(query_cpu)
+        assert probs.shape == (4,)
+        assert ((probs >= 0) & (probs <= 1)).all()
+
+        if torch.cuda.is_available():
+            torch.manual_seed(0)
+            cuda_model = CAIMIRA(n_subjects=4, n_items=6, embedding_dim=8, latent_dim=3)
+            cuda_model.set_embeddings(torch.randn(6, 8))
+            cuda_model.to("cuda")
+            cuda_probs = cuda_model.predict(query_cpu)
+            assert cuda_probs.device.type == "cuda"
+            assert cuda_probs.shape == (4,)
+
+    def test_fit_method_em_raises_value_error(self):
+        """``fit(method='em')`` (or any non-``'mle'`` value) must raise a
+        clear ``ValueError``.
+
+        Regression test for A3: before the patch, an unknown ``method``
+        slipped into ``**kwargs`` and was forwarded to
+        :func:`mle_fit`, surfacing as a cryptic ``TypeError`` about an
+        unexpected keyword argument far from the caller's intent.
+        """
+        torch.manual_seed(0)
+        model = CAIMIRA(n_subjects=4, n_items=6, embedding_dim=8, latent_dim=2)
+        embeddings = torch.randn(6, 8)
+        responses = torch.bernoulli(torch.full((4, 6), 0.5))
+        with pytest.raises(ValueError, match="only supports method='mle'"):
+            model.fit(responses, embeddings, max_epochs=2, verbose=False, method="em")
+
+    def test_predict_embeddings_default_center_frozen_matches_manual_equation_after_state_dict_load(self):
+        """``predict_embeddings`` with default ``center='frozen'`` must
+        equal the paper equation after a ``state_dict()`` round-trip.
+
+        Pins the cold-start probability surface across serialize /
+        deserialize, which is the realistic deployment path: train on one
+        host, ship ``state_dict()`` to a fresh process, and score new
+        items with ``predict_embeddings``. The frozen-mean buffer is the
+        only piece of training-time centering state that the fresh
+        instance carries, so it must reproduce the paper equation
+        ``sigmoid((s - d) . r)`` exactly.
+        """
+        torch.manual_seed(0)
+        n_subjects, n_items, embed, latent = 4, 6, 8, 3
+        model = CAIMIRA(n_subjects=n_subjects, n_items=n_items, embedding_dim=embed, latent_dim=latent)
+        train_embeddings = torch.randn(n_items, embed)
+        model.set_embeddings(train_embeddings)
+        with torch.no_grad():
+            model._difficulty_mean.copy_(model.difficulty_head(train_embeddings).mean(dim=0))
+
+        state = model.state_dict()
+        clone = CAIMIRA(n_subjects=n_subjects, n_items=n_items, embedding_dim=embed, latent_dim=latent)
+        clone.load_state_dict(state, strict=True)
+        clone.eval()
+
+        subject_idx = torch.tensor([0, 1, 2, 3], dtype=torch.long)
+        cold_embeddings = torch.randn(4, embed)
+        p_from_method = clone.predict_embeddings(subject_idx, cold_embeddings)
+
+        with torch.no_grad():
+            relevance = torch.softmax(clone.relevance_head(cold_embeddings), dim=-1)
+            d_raw = clone.difficulty_head(cold_embeddings)
+            difficulty = d_raw - clone._difficulty_mean
+            p_manual = torch.sigmoid(((clone.skill[subject_idx] - difficulty) * relevance).sum(dim=-1))
+        assert p_from_method.shape == (4,)
+        assert torch.allclose(p_from_method, p_manual, atol=1e-6)

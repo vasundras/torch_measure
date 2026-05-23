@@ -69,9 +69,9 @@ REGISTRY_FILES = frozenset({"subjects.parquet", "items.parquet", "benchmarks.par
 _RESPONSE_COLS = ("subject_id", "item_id", "benchmark_id", "test_condition", "response")
 
 # EB-table build hyperparameters.
-_EB_SBC_MIN_N = 3        # triple cell needs >= 3 obs to land in sbc
-_EB_SUBJ_MIN_N = 10      # subject prior needs >= 10 obs
-_EB_SB_ALPHA = 5.0       # Bayesian pseudo-counts toward IRT blend at level 2
+_EB_SBC_MIN_N = 3  # triple cell needs >= 3 obs to land in sbc
+_EB_SUBJ_MIN_N = 10  # subject prior needs >= 10 obs
+_EB_SB_ALPHA = 5.0  # Bayesian pseudo-counts toward IRT blend at level 2
 
 # Probability clipping at table-build time. Avoids inf in logit().
 _TABLE_CLIP_LO = 0.05
@@ -82,23 +82,29 @@ DEFAULT_OUTPUT_DIR = _THIS_DIR
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--smoke", action="store_true",
-                   help="Single benchmark (mmlupro), 5 epochs, 1000-row cap.")
-    p.add_argument("--benchmarks", nargs="*", default=None,
-                   help="Subset of response parquets to train on.")
+    p.add_argument("--smoke", action="store_true", help="Single benchmark (mmlupro), 5 epochs, 1000-row cap.")
+    p.add_argument("--benchmarks", nargs="*", default=None, help="Subset of response parquets to train on.")
     p.add_argument("--epochs", type=int, default=200)
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--weight-decay", type=float, default=0.0)
-    p.add_argument("--latent-dim", type=int, default=5,
-                   help="CAIMIRA latent skill dimension; matches paper m=5.")
-    p.add_argument("--blend-lambdas", type=float, nargs="*", default=[0.6],
-                   help="Runtime CAIMIRA-vs-EB blend weights to carry into artifact metadata.")
+    p.add_argument("--latent-dim", type=int, default=5, help="CAIMIRA latent skill dimension; matches paper m=5.")
+    p.add_argument(
+        "--blend-lambdas",
+        type=float,
+        nargs="*",
+        default=[0.6],
+        help="Runtime CAIMIRA-vs-EB blend weights to carry into artifact metadata.",
+    )
     p.add_argument("--difficulty-reg", type=float, default=1e-4)
     p.add_argument("--skill-reg", type=float, default=1e-4)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--device", default=None)
-    p.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR,
-                   help=f"Where to write artifacts. Default {DEFAULT_OUTPUT_DIR}.")
+    p.add_argument(
+        "--output-dir",
+        type=Path,
+        default=DEFAULT_OUTPUT_DIR,
+        help=f"Where to write artifacts. Default {DEFAULT_OUTPUT_DIR}.",
+    )
     p.add_argument("--encode-batch", type=int, default=64)
     return p.parse_args()
 
@@ -114,8 +120,7 @@ def set_seed(seed: int) -> None:
 def list_response_files(repo_id: str = REPO_ID, revision: str = REVISION) -> list[str]:
     files = HfApi().list_repo_files(repo_id=repo_id, repo_type="dataset", revision=revision)
     return sorted(
-        n for n in files
-        if n.endswith(".parquet") and n not in REGISTRY_FILES and not n.endswith("_traces.parquet")
+        n for n in files if n.endswith(".parquet") and n not in REGISTRY_FILES and not n.endswith("_traces.parquet")
     )
 
 
@@ -170,14 +175,16 @@ def collect_binary_examples(
             continue
         subject_display = subject.get("display_name") or row["subject_id"]
         subject_content = f"Name: {subject_display}"
-        by_bench[row["benchmark_id"]].append({
-            "benchmark": row["benchmark_id"],
-            "condition": row["test_condition"] or "none",
-            "subject_name": subject_display,
-            "subject_content": subject_content,
-            "item_content": item_content,
-            "label": float(row["response"]),
-        })
+        by_bench[row["benchmark_id"]].append(
+            {
+                "benchmark": row["benchmark_id"],
+                "condition": row["test_condition"] or "none",
+                "subject_name": subject_display,
+                "subject_content": subject_content,
+                "item_content": item_content,
+                "label": float(row["response"]),
+            }
+        )
 
     examples: list[dict[str, Any]] = []
     for _bench, rows in by_bench.items():
@@ -235,6 +242,8 @@ def build_long_form(
 
 
 def _logit(p: float) -> float:
+    if not math.isfinite(p):
+        raise ValueError(f"_logit requires finite input, got {p!r}")
     p = max(1e-7, min(1 - 1e-7, p))
     return math.log(p / (1 - p))
 
@@ -330,14 +339,11 @@ def main() -> None:
     args = parse_args()
     set_seed(args.seed)
 
-    device = torch.device(
-        args.device if args.device is not None else ("cuda" if torch.cuda.is_available() else "cpu")
-    )
+    device = torch.device(args.device if args.device is not None else ("cuda" if torch.cuda.is_available() else "cpu"))
     print(f"[train_caimira] Device: {device}")
 
     response_files = (
-        ["mmlupro.parquet"] if args.smoke
-        else (args.benchmarks if args.benchmarks else list_response_files())
+        ["mmlupro.parquet"] if args.smoke else (args.benchmarks if args.benchmarks else list_response_files())
     )
     print(f"[train_caimira] Benchmarks: {response_files}")
 
@@ -351,9 +357,7 @@ def main() -> None:
         raise SystemExit("[train_caimira] No binary examples — abort.")
 
     subject_to_idx, item_to_idx, ordered_items = build_indices(examples)
-    print(
-        f"[train_caimira] Indices: subjects={len(subject_to_idx):,}  items={len(item_to_idx):,}"
-    )
+    print(f"[train_caimira] Indices: subjects={len(subject_to_idx):,}  items={len(item_to_idx):,}")
 
     encoder = SentenceTransformer(ENCODER_REPO, device=str(device))
     embeddings = encode_items(ordered_items, encoder, args.encode_batch)
@@ -375,9 +379,7 @@ def main() -> None:
         embedding_dim=embeddings.shape[1],
         latent_dim=args.latent_dim,
     )
-    wide_response = _build_wide_response(
-        s_all, i_all, y_all, len(subject_to_idx), len(item_to_idx)
-    )
+    wide_response = _build_wide_response(s_all, i_all, y_all, len(subject_to_idx), len(item_to_idx))
     history = model.fit(
         wide_response,
         embeddings=embeddings,
@@ -399,7 +401,19 @@ def main() -> None:
     eb_path = args.output_dir / "eb_tables.json"
 
     model_cpu = model.to("cpu").eval()
-    torch.save(model_cpu.state_dict(), pt_path)
+    # NaN/inf guard: refuse to ship a state_dict with poisoned tensors. The
+    # silent NCF head load failure from April 2026 (3 weeks of constant-0.5
+    # leaderboard signal) was traced to a producer-side artifact corruption
+    # that the consumer's defensive ``try/except → 0.5`` masked; loud failure
+    # at producer time is the right discipline. See
+    # ../docs/solutions/runtime-errors/silent-ncf-head-load-failure-via-full-module-pickle-2026-05-17.md
+    state_dict_to_save = model_cpu.state_dict()
+    for name, tensor in state_dict_to_save.items():
+        if not torch.isfinite(tensor).all():
+            raise SystemExit(
+                f"[train_caimira] NaN/inf detected in state_dict tensor {name!r}; refusing to ship poisoned weights."
+            )
+    torch.save(state_dict_to_save, pt_path)
     print(f"[train_caimira] Saved CAIMIRA state_dict → {pt_path}")
 
     # Round-trip verification: load through the SHIPPABLE caimira_lite class
@@ -416,9 +430,7 @@ def main() -> None:
     state = torch.load(pt_path, map_location="cpu", weights_only=True)
     missing, unexpected = fresh.load_state_dict(state, strict=False)
     if missing or unexpected:
-        raise SystemExit(
-            f"[train_caimira] state_dict shape mismatch — missing={missing} unexpected={unexpected}"
-        )
+        raise SystemExit(f"[train_caimira] state_dict shape mismatch — missing={missing} unexpected={unexpected}")
     print("[train_caimira]   round-trip into CAIMIRALite OK (no missing/unexpected keys)")
 
     eb_path.write_text(json.dumps(eb_tables, indent=2))
@@ -462,9 +474,7 @@ def main() -> None:
     print("AND worst hidden score — D-9 is a hard prerequisite, not a formality.")
 
 
-def _build_wide_response(
-    s: torch.Tensor, i: torch.Tensor, y: torch.Tensor, n_subj: int, n_items: int
-) -> torch.Tensor:
+def _build_wide_response(s: torch.Tensor, i: torch.Tensor, y: torch.Tensor, n_subj: int, n_items: int) -> torch.Tensor:
     """Long-form -> wide-form, averaging duplicate subject-item cells.
 
     CAIMIRA.fit accepts wide-form tensors per its

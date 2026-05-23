@@ -79,6 +79,5 @@ def test_predict_batch_with_labeled_matches_predict_with_labeled():
     loop_result = pred_loop.predict(_record(), labeled=_labeled())
 
     assert batch_result == loop_result, (
-        f"predict_batch={batch_result} differs from predict={loop_result} "
-        "when both receive the same labeled list"
+        f"predict_batch={batch_result} differs from predict={loop_result} when both receive the same labeled list"
     )

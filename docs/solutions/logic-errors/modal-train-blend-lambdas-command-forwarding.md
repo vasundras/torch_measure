@@ -1,6 +1,7 @@
 ---
 title: "Modal `blend_lambdas` metadata drift from the training command"
 date: 2026-05-22
+last_updated: 2026-05-22
 category: logic-errors
 module: modal_train
 problem_type: logic_error

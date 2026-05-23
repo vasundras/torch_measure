@@ -16,9 +16,16 @@ Computerized Adaptive Testing, psychometric metrics, and factor models.
    :caption: API Reference
 
    api/models
+   api/experimental
    api/cat
    api/metrics
    api/data
+
+.. toctree::
+   :maxdepth: 1
+   :caption: Examples
+
+   examples/caimira_cold_start
 
 .. toctree::
    :maxdepth: 1

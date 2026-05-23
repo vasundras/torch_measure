@@ -72,10 +72,38 @@ def test_provider_prefixes_parity(lib, ship):
         "   ",
         "no_name_line",
         "Name: Claude-3-Opus\nOrganization: Anthropic\nParameters: 175B",
+        # Whitespace-only ``Name:`` values must NOT IndexError (the regex
+        # group captures the trailing whitespace, then ``.strip().splitlines()``
+        # collapses to an empty list — both copies guard the ``[0]`` indexing).
+        "Name: ",
+        "Name:  ",
+        "Name: \n",
+        "Name: \t",
     ],
 )
 def test_parse_subject_name_parity(lib, ship, subject_content):
     assert lib.parse_subject_name(subject_content) == ship.parse_subject_name(subject_content)
+
+
+@pytest.mark.parametrize("subject_content", ["Name: ", "Name:  ", "Name: \n", "Name: \t"])
+def test_parse_subject_name_whitespace_only_returns_empty(lib, ship, subject_content):
+    """Regression guard: whitespace-only ``Name:`` values must return ``""``
+    rather than raise ``IndexError`` from ``splitlines()[0]`` on an empty list.
+    """
+    assert lib.parse_subject_name(subject_content) == ""
+    assert ship.parse_subject_name(subject_content) == ""
+
+
+def test_eb_lookup_and_cold_start_lookup_default_output_clip_match(lib, ship):
+    """RES-2 parity: both ``EBLookup`` and ``ColdStartLookupPredictor`` default
+    ``output_clip`` to ``(0.02, 0.98)`` (the library-side default; previously
+    drifted to ``(_CLIP_LO, _CLIP_HI) == (0.05, 0.95)`` on the shipped copy).
+    """
+    eb = ship.EBLookup(sbc={}, sb={}, subj={}, bench={}, global_mean=0.5)
+    cold = lib.ColdStartLookupPredictor(sbc={}, sb={}, subj={}, bench={}, global_mean=0.5)
+    assert eb.output_clip == (0.02, 0.98)
+    assert cold.output_clip == (0.02, 0.98)
+    assert eb.output_clip == cold.output_clip
 
 
 @pytest.mark.parametrize(

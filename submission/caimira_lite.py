@@ -50,9 +50,9 @@ Hybrid (CAIMIRA + EB):
 
 References
 ----------
-- Lalor, J. P., Yang, W., Smith, K., Forde, J. Z., Resnik, P., Rodriguez, P.
-  "Do great minds think alike? Investigating Human-AI Complementarity in
-  Question Answering with CAIMIRA." EMNLP 2024. arXiv:2410.06524.
+- Gor, M., Daumé III, H., Zhou, F., Boyd-Graber, J. "Do great minds think
+  alike? Investigating Human-AI Complementarity in Question Answering with
+  CAIMIRA." EMNLP 2024. arXiv:2410.06524.
 - Rasch, G. (1960). Probabilistic models for some intelligence and
   attainment tests. Danish Institute for Educational Research.
 - Platt, J. (1999). Probabilistic outputs for support vector machines.
@@ -77,9 +77,20 @@ CAIMIRA_ARCH_VERSION = 1
 # but not in display_name (e.g. "meta-llama/Llama-2-7b-chat" vs "Llama-2-7b-chat").
 # Sourced verbatim from torch_measure.models.cold_start_lookup.
 _DEFAULT_PROVIDER_PREFIXES: tuple[str, ...] = (
-    "meta-llama/", "openai/", "mistralai/", "google/", "anthropic/",
-    "microsoft/", "huggingface/", "tiiuae/", "deepmind/", "cohere/",
-    "allenai/", "01-ai/", "qwen/", "baichuan-inc/",
+    "meta-llama/",
+    "openai/",
+    "mistralai/",
+    "google/",
+    "anthropic/",
+    "microsoft/",
+    "huggingface/",
+    "tiiuae/",
+    "deepmind/",
+    "cohere/",
+    "allenai/",
+    "01-ai/",
+    "qwen/",
+    "baichuan-inc/",
 )
 
 # Predict-time probability bounds. Avoid 0 / 1 in logit() and keep NLL finite.
@@ -144,7 +155,10 @@ def parse_subject_name(subject_content: str) -> str:
         return ""
     m = re.match(r"\s*Name:\s*(.+)", subject_content)
     if m:
-        return m.group(1).strip().splitlines()[0].strip()
+        lines = m.group(1).strip().splitlines()
+        if lines:
+            return lines[0].strip()
+        return ""
     return subject_content.split("\n", 1)[0].strip()
 
 
@@ -167,7 +181,7 @@ def resolve_subject_name(
     raw_lower = raw_name.lower()
     for prefix in provider_prefixes:
         if raw_lower.startswith(prefix):
-            candidates.append(raw_name[len(prefix):].strip())
+            candidates.append(raw_name[len(prefix) :].strip())
             break
 
     for cand in candidates:
@@ -282,7 +296,7 @@ class EBLookup:
         name_aliases: dict[str, str] | None = None,
         name_lc: dict[str, str] | None = None,
         platt_shift_cap: float = _DEFAULT_PLATT_SHIFT_CAP,
-        output_clip: tuple[float, float] = (_CLIP_LO, _CLIP_HI),
+        output_clip: tuple[float, float] = (0.02, 0.98),
     ) -> None:
         self.sbc = dict(sbc)
         self.sb = dict(sb)
@@ -318,8 +332,12 @@ class EBLookup:
 
     def resolve_name(self, raw_name: str) -> str:
         return resolve_subject_name(
-            raw_name, self.subj, self.sb, self.sbc,
-            self.name_aliases, self.name_lc,
+            raw_name,
+            self.subj,
+            self.sb,
+            self.sbc,
+            self.name_aliases,
+            self.name_lc,
         )
 
     def lookup_p(self, subj_name: str, benchmark: str, condition: str) -> float:
@@ -366,6 +384,14 @@ class EBLookup:
         Idempotent w.r.t. labeled list length (cached). With K=5 examples
         per benchmark a 2-parameter fit destroys subject ordering (slope
         collapses to ~0.1), so we shift only and cap at ``±platt_shift_cap``.
+
+        **Codabench-only optimization.** The ``len(labeled)``-key cache is
+        valid here because the hosted Codabench runtime sends the same
+        ``labeled`` list throughout a round; library callers that pass
+        distinct labeled lists of equal length within one process MUST NOT
+        rely on this pattern. The upstream
+        :meth:`torch_measure.models.cold_start_lookup.ColdStartLookupPredictor.calibrate`
+        intentionally does NOT carry this cache for that reason.
         """
         new_key = len(labeled)
         if new_key == self._platt_fit_key:

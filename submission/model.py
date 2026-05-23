@@ -60,6 +60,7 @@ against a hidden leaderboard.
 from __future__ import annotations
 
 import json
+import math
 import os
 import sys
 from collections import OrderedDict
@@ -83,8 +84,10 @@ from caimira_lite import (  # noqa: E402
 )
 
 # CAIMIRA-vs-EB blend weight in logit space. Higher = more CAIMIRA-leaning.
-# Fixed at 0.6 as the conservative default per the Wave-2 Lane-B
-# recommendation. D-9 ablation candidates: {0.3, 0.5, 0.7, 0.9}.
+# Default 0.6 (conservative per Wave-2 Lane-B recommendation), but the trainer
+# can override via ``META["blend_lambda"]`` so D-9 ablation candidates
+# ``{0.3, 0.5, 0.7, 0.9}`` can ship without code edits. ``_initialize_runtime``
+# rebinds this module global when META is loaded.
 _BLEND_LAMBDA: float = 0.6
 
 # Artifact paths (resolved relative to this file's directory).
@@ -97,7 +100,12 @@ _EB_PATH = Path(_SUBMISSION_DIR) / "eb_tables.json"
 ENCODER_REPO = "sentence-transformers/all-mpnet-base-v2"
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-_MAX_ITEM_CACHE = 2048
+# Env-configurable LRU bound for the per-round item-embedding cache. Default
+# 8192 = ~24 MB at fp32x768 (well under any plausible container budget);
+# operators can shrink via ``PEVAL_MAX_ITEM_CACHE=512`` for memory-constrained
+# debug runs. The test-time monkey-patch ``mod._MAX_ITEM_CACHE = N`` continues
+# to work because the module attribute is an int rebound at the call site.
+_MAX_ITEM_CACHE = int(os.environ.get("PEVAL_MAX_ITEM_CACHE", "8192"))
 
 
 def _logit(p: float) -> float:
@@ -106,8 +114,6 @@ def _logit(p: float) -> float:
     Non-finite input raises ``ValueError`` rather than silently collapsing
     to ``±16.118`` via the ``max/min`` ladder's NaN semantics.
     """
-    import math
-
     if not math.isfinite(p):
         raise ValueError(f"_logit requires finite input, got {p!r}")
     p = max(1e-7, min(1 - 1e-7, p))
@@ -116,8 +122,6 @@ def _logit(p: float) -> float:
 
 def _sigmoid(x: float) -> float:
     """Numerically stable sigmoid; mirrors caimira_lite._sigmoid."""
-    import math
-
     if x >= 0:
         return 1.0 / (1.0 + math.exp(-x))
     e = math.exp(x)
@@ -145,6 +149,17 @@ EB: EBLookup | None = None
 META: dict[str, Any] | None = None
 SUBJECT_TO_IDX: dict[str, int] = {}
 
+# Per-round Platt-calibration cache; hoisted here so _initialize_runtime() can
+# safely call ``_PLATT_CACHE.clear()`` during module import on a fresh Codabench
+# container (LEGB lookup needs the binding to exist before the call site runs;
+# the pre-Lane-B layout declared this AFTER _initialize_runtime() was called,
+# which raised ``NameError: name '_PLATT_CACHE' is not defined`` and is the
+# Codabench-fatal B7 bug). Keyed by ``len(labeled)``; values are the
+# per-benchmark intercept-only Platt shifts fit against
+# ``_base_predict_probability`` (the same base predict() walk at apply time,
+# so fit-base and apply-base are consistent).
+_PLATT_CACHE: dict[int, dict[str, tuple[float, float]]] = {}
+
 
 def _load_encoder(encoder_cls: Any, device: str) -> Any:
     """Load the prefetched encoder without allowing runtime network access."""
@@ -169,7 +184,7 @@ def _initialize_runtime(
     the production prediction path without touching the real artifact files
     or the SentenceTransformer cache.
     """
-    global DEVICE, META, CAIMIRA, EB, SUBJECT_TO_IDX, ENCODER, _item_cache  # noqa: PLW0603
+    global DEVICE, META, CAIMIRA, EB, SUBJECT_TO_IDX, ENCODER, _item_cache, _BLEND_LAMBDA  # noqa: PLW0603
 
     _PLATT_CACHE.clear()
     runtime_device = torch.device(device) if device is not None else torch.device(DEVICE)
@@ -180,6 +195,12 @@ def _initialize_runtime(
     n_items = int(META["n_items"])
     embed_dim = int(META.get("embed_dim", EMBED_DIM))
     latent_dim = int(META.get("latent_dim", 5))
+    # Trainer can ship per-artifact blend lambda for D-9 ablation (override
+    # the conservative 0.6 default at the module-global). The module-level
+    # ``_BLEND_LAMBDA`` was defined before this call site, so falls back to
+    # 0.6 if META omits the key (older artifacts predating the meta-keyed
+    # blend behavior remain compatible).
+    _BLEND_LAMBDA = float(META.get("blend_lambda", _BLEND_LAMBDA))
 
     head = CAIMIRALite(
         n_subjects=n_subjects,
@@ -212,6 +233,7 @@ if _LOCAL_SMOKE:
 else:
     _initialize_runtime()
 
+
 def _render_item_text(ex: dict) -> str:
     """Render the exact Benchmark/Condition/Item template used in training."""
     benchmark = (ex.get("benchmark") or "").strip()
@@ -235,7 +257,15 @@ def _encode_item(ex: dict) -> torch.Tensor:
         show_progress_bar=False,
         normalize_embeddings=False,
     )
-    vec = vec.to(DEVICE).float().view(-1)
+    # Anchor the embedding's target device on CAIMIRA's actual parameter
+    # device, not the module-global ``DEVICE``. ``DEVICE`` can go stale when
+    # ``_initialize_runtime`` is called with an explicit ``device=`` after the
+    # initial module-import value has already been baked in (e.g. a CUDA-state
+    # artifact loaded onto CPU, or a test stub). Falls back to ``DEVICE`` only
+    # when CAIMIRA is unloaded (LOCAL_SMOKE-mode tests that monkey-patch
+    # ENCODER without setting CAIMIRA); production always has CAIMIRA loaded.
+    target_device = next(CAIMIRA.parameters()).device if CAIMIRA is not None else DEVICE
+    vec = vec.to(target_device).float().view(-1)
     _item_cache[item_text] = vec
     _item_cache.move_to_end(item_text)
     if len(_item_cache) > _MAX_ITEM_CACHE:
@@ -269,25 +299,32 @@ def _base_predict_probability(ex: dict) -> float:
     return _blend_logits(caimira_p, eb_p, _BLEND_LAMBDA)
 
 
-_PLATT_CACHE: dict[int, dict[str, tuple[float, float]]] = {}
-
-
 def _fit_base_logit_platt(
     labeled: list[dict],
     base_predictor: Any,
 ) -> dict[str, tuple[float, float]]:
     """Fit intercept-only Platt shifts on actual base predictor logits.
 
-    Cached by ``len(labeled)`` to avoid recomputing the Platt fit on every
-    ``predict()`` call in the round. The platform sends the same labeled
-    list throughout a round; recomputing the fit per hidden item is wasted
-    work and (more importantly) triggers ``base_predictor`` per labeled
-    row per hidden item — a CAIMIRA forward + EB lookup blow-up. Matches
-    the ``self._platt_fit_key = len(labeled)`` caching in
+    **Codabench-only optimization.** Cached by ``len(labeled)`` to avoid
+    recomputing the Platt fit on every ``predict()`` call in the round. The
+    platform sends the same labeled list throughout a round; recomputing the
+    fit per hidden item is wasted work and (more importantly) triggers
+    ``base_predictor`` per labeled row per hidden item — a CAIMIRA forward
+    + EB lookup blow-up at ~10,000 hidden items per Ed #160 staff reply
+    2026-05-21.
+
+    The sibling :meth:`submission.caimira_lite.EBLookup.fit_platt` carries
+    the same ``len(labeled)``-key cache for the same reason.
+
+    **Library classes MUST NOT use this pattern.** The upstream
     :meth:`torch_measure.models.cold_start_lookup.ColdStartLookupPredictor.calibrate`
-    and :meth:`submission.caimira_lite.EBLookup.fit_platt`. The cache is
-    cleared by :func:`_initialize_runtime` so test re-inits do not leak
-    stale entries.
+    no longer caches by ``len(labeled)`` (the previous fork-only cache was
+    removed in the Lane B / PR #2 v2 round). Library callers may pass
+    distinct labeled lists of equal length within a single process; the
+    ``len``-key cache pattern only works on the Codabench-specific
+    guarantee that the platform sends the same ``labeled`` throughout a
+    round. The cache here is cleared by :func:`_initialize_runtime` so
+    test re-inits do not leak stale entries.
     """
     cache_key = len(labeled)
     cached = _PLATT_CACHE.get(cache_key)

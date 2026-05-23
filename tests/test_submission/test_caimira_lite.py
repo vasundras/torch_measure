@@ -161,7 +161,11 @@ class TestResolveSubjectName:
         subj = {"Llama-2-7b-chat": 0.7}
         name = resolve_subject_name(
             "meta-llama/Llama-2-7b-chat",
-            subj, {}, {}, {}, {},
+            subj,
+            {},
+            {},
+            {},
+            {},
         )
         assert name == "Llama-2-7b-chat"
 
@@ -246,8 +250,7 @@ class TestEBLookupPlatt:
             global_mean=0.50,
         )
         labeled = [
-            {"subject_content": f"Name: m{i}", "benchmark": "b1", "condition": "x",
-             "label": 1.0 if i % 2 == 0 else 0.0}
+            {"subject_content": f"Name: m{i}", "benchmark": "b1", "condition": "x", "label": 1.0 if i % 2 == 0 else 0.0}
             for i in range(8)
         ]
         # mean_y = 0.5 → target_logit = 0; mean_x = logit(0.05) ≈ -2.94.
@@ -284,8 +287,7 @@ class TestEBLookupPlatt:
         )
         p_no_labeled = lookup.predict("Name: m", "b1", "x", labeled=None)
         labeled = [
-            {"subject_content": f"Name: m{i}", "benchmark": "b1", "condition": "x",
-             "label": 1.0 if i % 2 == 0 else 0.0}
+            {"subject_content": f"Name: m{i}", "benchmark": "b1", "condition": "x", "label": 1.0 if i % 2 == 0 else 0.0}
             for i in range(4)
         ]
         p_with_labeled = lookup.predict("Name: m", "b1", "x", labeled=labeled)
