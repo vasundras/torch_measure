@@ -40,7 +40,11 @@ _MAX_TOKENS = 256
 _MAX_SEEN = 128
 _MAX_STRATA = 256
 _TIE_EPSILON = 0.01
-_TOKEN_RE = re.compile(r"[a-z0-9]+")
+# Unicode-aware token regex. Matches Latin word chars AND letters/digits in
+# CJK, Cyrillic, Arabic, Devanagari, etc. The earlier ``[a-z0-9]+`` pattern
+# stripped every non-Latin glyph, collapsing pure non-Latin items to an empty
+# token list and forcing identical SimHash signatures across the round.
+_TOKEN_RE = re.compile(r"\w+", re.UNICODE)
 
 _seen_signatures: list[int] = []
 _stratum_counts: dict[tuple[str, str, str], int] = {}
@@ -130,8 +134,18 @@ def _stratum_key(ex: dict) -> tuple[str, str, str]:
 
 def _metadata_bonus(ex: dict) -> float:
     key = _stratum_key(ex)
-    count = _stratum_counts.get(key, 0)
-    return 0.20 / float(1 + count)
+    if key in _stratum_counts:
+        return 0.20 / float(1 + _stratum_counts[key])
+    # Stratum not yet in the bounded dict. If we are at the ``_MAX_STRATA``
+    # cap, ``_update_stratum`` will refuse the insert. Returning ``0.20``
+    # here in the at-cap case would let every overflow stratum get the
+    # MAXIMUM bonus while frequently-seen early strata decay toward 0 —
+    # late candidates would systematically out-rank early helpful ones.
+    if len(_stratum_counts) >= _MAX_STRATA:
+        return 0.0
+    # Below cap: a brand-new stratum will be admitted by the subsequent
+    # ``_update_stratum`` call, so preserve the original under-seen reward.
+    return 0.20
 
 
 def _update_stratum(ex: dict) -> None:
