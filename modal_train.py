@@ -93,6 +93,41 @@ def _resolve_smoke_and_epochs(kind: str, smoke: bool, epochs: int) -> tuple[bool
     return smoke, epochs
 
 
+def _build_train_command(
+    submission_dir: Path,
+    latent_dim: int,
+    seed: int,
+    epochs: int,
+    lr: float,
+    smoke: bool,
+    benchmarks: list[str],
+    blend_lambdas: list[float],
+) -> list[str]:
+    command = [
+        sys.executable,
+        "/root/submission/train.py",
+        "--output-dir",
+        str(submission_dir),
+        "--latent-dim",
+        str(latent_dim),
+        "--seed",
+        str(seed),
+        "--epochs",
+        str(epochs),
+        "--lr",
+        str(lr),
+    ]
+    if smoke:
+        command.append("--smoke")
+    if benchmarks:
+        command.append("--benchmarks")
+        command.extend(benchmarks)
+    if blend_lambdas:
+        command.append("--blend-lambdas")
+        command.extend(str(lambda_) for lambda_ in blend_lambdas)
+    return command
+
+
 def sha256_file(path: Path) -> str:
     h = hashlib.sha256()
     with path.open("rb") as fh:
@@ -192,25 +227,16 @@ def _remote_train_impl(
     }
     write_json(out_dir / "config.json", config)
 
-    command = [
-        sys.executable,
-        "/root/submission/train.py",
-        "--output-dir",
-        str(submission_dir),
-        "--latent-dim",
-        str(latent_dim),
-        "--seed",
-        str(seed),
-        "--epochs",
-        str(epochs),
-        "--lr",
-        str(lr),
-    ]
-    if smoke:
-        command.append("--smoke")
-    if benchmarks:
-        command.append("--benchmarks")
-        command.extend(benchmarks)
+    command = _build_train_command(
+        submission_dir=submission_dir,
+        latent_dim=latent_dim,
+        seed=seed,
+        epochs=epochs,
+        lr=lr,
+        smoke=smoke,
+        benchmarks=benchmarks,
+        blend_lambdas=blend_lambdas,
+    )
     (out_dir / "command.txt").write_text(" ".join(shlex.quote(part) for part in command) + "\n", encoding="utf-8")
 
     start = time.time()

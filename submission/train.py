@@ -91,6 +91,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--weight-decay", type=float, default=0.0)
     p.add_argument("--latent-dim", type=int, default=5,
                    help="CAIMIRA latent skill dimension; matches paper m=5.")
+    p.add_argument("--blend-lambdas", type=float, nargs="*", default=[0.6],
+                   help="Runtime CAIMIRA-vs-EB blend weights to carry into artifact metadata.")
     p.add_argument("--difficulty-reg", type=float, default=1e-4)
     p.add_argument("--skill-reg", type=float, default=1e-4)
     p.add_argument("--seed", type=int, default=42)
@@ -429,6 +431,7 @@ def main() -> None:
         "item_key": "benchmark||condition||item_content",
         "epochs": epochs,
         "lr": args.lr,
+        "blend_lambdas": args.blend_lambdas,
         "weight_decay": args.weight_decay,
         "difficulty_reg": args.difficulty_reg,
         "skill_reg": args.skill_reg,

@@ -86,6 +86,29 @@ def test_cli_smoke_kind_forces_smoke_and_caps_epochs(modal_train):
     assert plan["epochs"] == 5
 
 
+def test_train_command_forwards_blend_lambdas(modal_train):  # pylint: disable=redefined-outer-name,protected-access
+    """Remote training command must not drop the operator's blend-lambda plan."""
+    command = modal_train._build_train_command(
+        submission_dir=Path("/tmp/modal-output"),
+        latent_dim=5,
+        seed=7,
+        epochs=100,
+        lr=1e-3,
+        smoke=False,
+        benchmarks=["mmlupro.parquet", "ai2d_test.parquet"],
+        blend_lambdas=[0.3, 0.6, 0.9],
+    )
+
+    assert command[-6:] == [
+        "mmlupro.parquet",
+        "ai2d_test.parquet",
+        "--blend-lambdas",
+        "0.3",
+        "0.6",
+        "0.9",
+    ]
+
+
 @pytest.mark.skipif(
     importlib.util.find_spec("modal") is None,
     reason="modal not installed; main entrypoint only defined when modal is importable",
