@@ -108,7 +108,10 @@ rm -f "${OUTPUT_ZIP}"
 ) >/dev/null
 
 # Post-build sanity: verify the ZIP is flat (no subdirectories).
-nested=$(unzip -l "${OUTPUT_ZIP}" | awk 'NR > 3 && /\// {print $NF}' | head -1 || true)
+# `unzip -Z1` prints one filename per line with no header / columns, which
+# tolerates filenames with spaces (the `unzip -l | awk` recipe split on
+# whitespace and would mis-parse "my model.py" as 5 fields with $NF == "model.py").
+nested=$(unzip -Z1 "${OUTPUT_ZIP}" | grep -F '/' | head -1 || true)
 if [[ -n "${nested}" ]]; then
   echo "build_zip.sh: ZIP contains nested paths (${nested}); aborting" >&2
   rm -f "${OUTPUT_ZIP}"
@@ -116,9 +119,9 @@ if [[ -n "${nested}" ]]; then
 fi
 
 # Post-build sanity: confirm exactly the allowlisted files landed.
-zip_files=$(unzip -l "${OUTPUT_ZIP}" | awk 'NR > 3 && NF >= 4 {print $NF}' | grep -v '^$' | grep -v '^-' || true)
+zip_files=$(unzip -Z1 "${OUTPUT_ZIP}" | grep -v '^$' || true)
 allow_csv=$(printf '%s\n' "${REQUIRED_FILES[@]}" | sort)
-actual_csv=$(echo "${zip_files}" | sort)
+actual_csv=$(printf '%s\n' "${zip_files}" | sort)
 if [[ "${allow_csv}" != "${actual_csv}" ]]; then
   echo "build_zip.sh: ZIP file list differs from allowlist" >&2
   echo "  expected: ${allow_csv//$'\n'/ , }" >&2
