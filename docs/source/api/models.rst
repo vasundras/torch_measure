@@ -27,6 +27,19 @@ IRT Models
    :members:
    :undoc-members:
 
+Predictive Evaluation Models
+----------------------------
+
+.. autoclass:: torch_measure.models.ColdStartLookupPredictor
+   :members:
+   :undoc-members:
+
+.. autoclass:: torch_measure.models.LLMJudgeIRT
+   :members:
+   :undoc-members:
+
+.. autofunction:: torch_measure.models.build_difficulty_prompt
+
 .. autoclass:: torch_measure.models.TabPFNPredictor
    :members:
    :undoc-members:

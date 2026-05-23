@@ -99,6 +99,22 @@ def test_cold_start_zero_priors_in_irt_blend_not_overridden_by_ci_view():
     assert p < 0.5, f"expected level-3 to use 0.0 priors, got {p}"
 
 
+def test_cold_start_none_condition_triple_uses_ci_view():
+    from torch_measure.models.cold_start_lookup import ColdStartLookupPredictor
+
+    pred = ColdStartLookupPredictor(
+        sbc={"gpt-4||mmlupro||none": 0.9},
+        sb={"gpt-4||mmlupro": 0.2},
+        subj={},
+        bench={},
+        global_mean=0.5,
+        name_aliases={},
+        name_lc={},
+    )
+    p = pred._lookup_p("GPT-4", "MMLUPRO", "cot")
+    assert p == 0.9
+
+
 def test_eb_lookup_zero_subj_prior_not_overridden_by_ci_view():
     import importlib
 
@@ -152,3 +168,20 @@ def test_eb_lookup_zero_priors_in_irt_blend_not_overridden_by_ci_view():
     eb._bench_ci["mmlupro"] = 0.9
     p = eb.lookup_p("gpt-4", "mmlupro", "x")
     assert p < 0.5, f"expected level-3 to use 0.0 priors, got {p}"
+
+
+def test_eb_lookup_none_condition_triple_uses_ci_view():
+    import importlib
+
+    cl = importlib.import_module("submission.caimira_lite")
+    eb = cl.EBLookup(
+        sbc={"gpt-4||mmlupro||none": 0.9},
+        sb={"gpt-4||mmlupro": 0.2},
+        subj={},
+        bench={},
+        global_mean=0.5,
+        name_aliases={},
+        name_lc={},
+    )
+    p = eb.lookup_p("GPT-4", "MMLUPRO", "cot")
+    assert p == 0.9

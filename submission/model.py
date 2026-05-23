@@ -62,6 +62,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+from collections import OrderedDict
 from pathlib import Path
 from typing import Any
 
@@ -96,6 +97,7 @@ _EB_PATH = Path(_SUBMISSION_DIR) / "eb_tables.json"
 ENCODER_REPO = "sentence-transformers/all-mpnet-base-v2"
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+_MAX_ITEM_CACHE = 2048
 
 
 def _logit(p: float) -> float:
@@ -198,10 +200,10 @@ def _initialize_runtime(
 
         encoder_factory = SentenceTransformer
     ENCODER = _load_encoder(encoder_factory, device=str(device))
-    _item_cache = {}
+    _item_cache = OrderedDict()
 
 
-_item_cache: dict[str, torch.Tensor] = {}
+_item_cache: OrderedDict[str, torch.Tensor] = OrderedDict()
 
 if _LOCAL_SMOKE:
     print("[submission/model] PREDICTIVE_EVAL_LOCAL_SMOKE_TEST=1 — skipping artifact loads")
@@ -222,6 +224,7 @@ def _encode_item(ex: dict) -> torch.Tensor:
     item_text = _render_item_text(ex)
     cached = _item_cache.get(item_text)
     if cached is not None:
+        _item_cache.move_to_end(item_text)
         return cached
     vec = ENCODER.encode(
         item_text,
@@ -232,6 +235,9 @@ def _encode_item(ex: dict) -> torch.Tensor:
     )
     vec = vec.to(DEVICE).float().view(-1)
     _item_cache[item_text] = vec
+    _item_cache.move_to_end(item_text)
+    if len(_item_cache) > _MAX_ITEM_CACHE:
+        _item_cache.popitem(last=False)
     return vec
 
 

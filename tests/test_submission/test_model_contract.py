@@ -102,6 +102,39 @@ class TestModelContract:
         out = mod.predict(dict(sample_input), labeled=[])
         assert 0.0 <= out <= 1.0
 
+    def test_item_embedding_cache_is_bounded_lru(self):
+        mod = _load_model_module()
+        import torch
+
+        class _FakeEncoder:
+            def encode(self, text, **_kwargs):
+                return torch.tensor([float(len(text))])
+
+        original_limit = mod._MAX_ITEM_CACHE
+        mod._MAX_ITEM_CACHE = 2
+        mod.ENCODER = _FakeEncoder()
+        mod.DEVICE = torch.device("cpu")
+        mod._item_cache.clear()
+        try:
+            rows = [
+                {
+                    "benchmark": "mmlupro",
+                    "condition": "cot",
+                    "subject_content": "Name: gpt-4",
+                    "item_content": f"What is {idx}?",
+                }
+                for idx in range(3)
+            ]
+            first_key = mod._render_item_text(rows[0])
+            for row in rows:
+                mod._encode_item(row)
+
+            assert len(mod._item_cache) == 2
+            assert first_key not in mod._item_cache
+        finally:
+            mod._MAX_ITEM_CACHE = original_limit
+            mod._item_cache.clear()
+
 
 class TestModelAcquisitionContract:
     def test_acquisition_function_signature(self):

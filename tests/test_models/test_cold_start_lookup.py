@@ -26,7 +26,6 @@ from torch_measure.models.cold_start_lookup import (
     resolve_subject_name,
 )
 
-
 # ---- Fixtures ---------------------------------------------------------------
 
 
@@ -233,6 +232,17 @@ class TestCalibration:
         ]
         predictor.calibrate(labeled)
         assert "mmlupro" not in predictor._platt
+
+    def test_calibration_skips_malformed_labels(
+        self, predictor: ColdStartLookupPredictor
+    ) -> None:
+        labeled = [
+            {"benchmark": "mmlupro", "subject_content": "Name: gpt-4", "label": "bad"},
+            {"benchmark": "mmlupro", "subject_content": "Name: claude-3", "label": 1},
+            {"benchmark": "mmlupro", "subject_content": "Name: llama-2-7b", "label": 0},
+        ]
+        predictor.calibrate(labeled)
+        assert "mmlupro" in predictor._platt
 
     def test_calibration_shift_is_capped(
         self, predictor: ColdStartLookupPredictor

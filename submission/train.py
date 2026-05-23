@@ -298,9 +298,16 @@ def build_eb_tables(examples: list[dict[str, Any]]) -> dict[str, Any]:
         shrunk = (n * raw_p + _EB_SB_ALPHA * prior_p) / (n + _EB_SB_ALPHA)
         sb[key] = _table_clip(shrunk)
 
-    # Name aliases + lowercase view for subject-name resolution.
-    canonical_names = list(subj.keys())
-    name_lc = {name.lower(): name for name in canonical_names}
+    # Name aliases + lowercase view for subject-name resolution. Subjects can
+    # be too sparse for a ``subj`` prior but still appear in sb/sbc cells, so
+    # build the resolver from every table that carries a subject key.
+    name_lc: dict[str, str] = {}
+    for name in subj:
+        name_lc.setdefault(name.lower(), name)
+    for table in (sb, sbc):
+        for key in table:
+            name = key.split("||", 1)[0]
+            name_lc.setdefault(name.lower(), name)
 
     print(
         f"[train_caimira]   global_mean={global_mean:.4f}  "
@@ -458,13 +465,21 @@ def main() -> None:
 def _build_wide_response(
     s: torch.Tensor, i: torch.Tensor, y: torch.Tensor, n_subj: int, n_items: int
 ) -> torch.Tensor:
-    """Long-form → wide-form (NaN for unobserved); only positional helper.
+    """Long-form -> wide-form, averaging duplicate subject-item cells.
 
     CAIMIRA.fit accepts wide-form tensors per its
-    :meth:`torch_measure.models._base.IRTModel.fit` contract.
+    :meth:`torch_measure.models._base.IRTModel.fit` contract. The training
+    data may contain multiple conditions for the same subject-item pair; mean
+    soft labels make that collapse deterministic instead of "last row wins".
     """
-    wide = torch.full((n_subj, n_items), float("nan"))
-    wide[s, i] = y
+    wide_sum = torch.zeros((n_subj, n_items), dtype=y.dtype, device=y.device)
+    wide_count = torch.zeros((n_subj, n_items), dtype=y.dtype, device=y.device)
+    wide_sum.index_put_((s, i), y, accumulate=True)
+    wide_count.index_put_((s, i), torch.ones_like(y), accumulate=True)
+
+    wide = torch.full((n_subj, n_items), float("nan"), dtype=y.dtype, device=y.device)
+    observed = wide_count > 0
+    wide[observed] = wide_sum[observed] / wide_count[observed]
     return wide
 
 

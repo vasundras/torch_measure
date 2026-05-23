@@ -258,6 +258,22 @@ class TestEBLookupPlatt:
         assert slope == 1.0
         assert abs(intercept - 1.5) < 1e-6  # capped
 
+    def test_calibrate_skips_malformed_labels(self):
+        lookup = EBLookup(
+            sbc={},
+            sb={},
+            subj={},
+            bench={"b1": 0.30},
+            global_mean=0.50,
+        )
+        labeled = [
+            {"subject_content": "Name: m1", "benchmark": "b1", "condition": "x", "label": "bad"},
+            {"subject_content": "Name: m2", "benchmark": "b1", "condition": "x", "label": 1.0},
+            {"subject_content": "Name: m3", "benchmark": "b1", "condition": "x", "label": 0.0},
+        ]
+        lookup.fit_platt(labeled)
+        assert "b1" in lookup._platt
+
     def test_predict_applies_platt_when_labeled(self):
         lookup = EBLookup(
             sbc={},

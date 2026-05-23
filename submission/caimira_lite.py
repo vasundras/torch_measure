@@ -334,6 +334,8 @@ class EBLookup:
         key3_none = f"{subj_name}||{benchmark}||none"
         if key3_none in self.sbc:
             return self.sbc[key3_none]
+        if key3_none.lower() in self._sbc_ci:
+            return self._sbc_ci[key3_none.lower()]
 
         key2 = f"{subj_name}||{benchmark}"
         if key2 in self.sb:
@@ -380,8 +382,12 @@ class EBLookup:
             subject_content = ex.get("subject_content", "") or ""
             raw_name = parse_subject_name(subject_content)
             subj_name = self.resolve_name(raw_name)
+            try:
+                label = float(ex["label"])
+            except (TypeError, ValueError):
+                continue
             p = self.lookup_p(subj_name, bench, cond)
-            by_bench.setdefault(bench, []).append((_logit(p), float(ex["label"])))
+            by_bench.setdefault(bench, []).append((_logit(p), label))
 
         for bench, pairs in by_bench.items():
             if len(pairs) < 2:

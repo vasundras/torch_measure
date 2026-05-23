@@ -51,6 +51,24 @@ def test_reservoir_replaces_after_max_seen(reset_labeling_globals):
     assert labeling._candidate_count == 130
 
 
+def test_reservoir_sampling_uses_post_increment_count(reset_labeling_globals, monkeypatch):
+    labeling = reset_labeling_globals
+    for idx in range(labeling._MAX_SEEN):
+        labeling.acquisition_function(_row(idx))
+
+    counts_seen = []
+    original_update = labeling._update_reservoir
+
+    def capture_count(signature, candidate_key):
+        counts_seen.append(labeling._candidate_count)
+        original_update(signature, candidate_key)
+
+    monkeypatch.setattr(labeling, "_update_reservoir", capture_count)
+    labeling.acquisition_function(_row(labeling._MAX_SEEN))
+
+    assert counts_seen == [labeling._MAX_SEEN + 1]
+
+
 def test_metadata_bonus_decays_per_stratum(reset_labeling_globals):
     labeling = reset_labeling_globals
     ex = _row(0)

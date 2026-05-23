@@ -251,7 +251,7 @@ class ColdStartLookupPredictor:
     # ---- Persistence -----------------------------------------------------
 
     @classmethod
-    def from_lookup_json(cls, path: str | Path, **overrides: Any) -> "ColdStartLookupPredictor":
+    def from_lookup_json(cls, path: str | Path, **overrides: Any) -> ColdStartLookupPredictor:
         """Load from the ``lookup.json`` artifact produced by the build script.
 
         Parameters
@@ -314,6 +314,8 @@ class ColdStartLookupPredictor:
         key3_none = f"{subj_name}||{benchmark}||none"
         if key3_none in self.sbc:
             return self.sbc[key3_none]
+        if key3_none.lower() in self._sbc_ci:
+            return self._sbc_ci[key3_none.lower()]
 
         # Level 2: pair (subject, benchmark).
         key2 = f"{subj_name}||{benchmark}"
@@ -443,8 +445,12 @@ class ColdStartLookupPredictor:
                 raw_name, self.subj, self.sb, self.sbc,
                 self.name_aliases, self.name_lc,
             )
+            try:
+                label = float(ex["label"])
+            except (TypeError, ValueError):
+                continue
             p = self._lookup_p(subj_name, bench, cond)
-            by_bench.setdefault(bench, []).append((_logit(p), float(ex["label"])))
+            by_bench.setdefault(bench, []).append((_logit(p), label))
 
         for bench, pairs in by_bench.items():
             if len(pairs) < 2:
