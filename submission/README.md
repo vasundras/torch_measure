@@ -132,12 +132,16 @@ This scaffolding has NO `try/except → 0.5` blocks anywhere in the
 prediction path. The only `try/except` is in `labeling.py`'s
 `acquisition_function`, which returns the distinguishable sentinel `0.0`
 (outside the legitimate `(0, 2]` output domain). Module-init failures
-propagate to the platform as a `[PAIEC-PREDICT-002]` error before any
-predictions run; `predict()` exceptions fail the submission loudly. The
-canonical bug pattern these rules defend against is the April 2026
-silent NCF load failure that produced 3 weeks of constant-0.5
-leaderboard signal — see the design-pattern docs in the parent CS321M
-repo's `docs/solutions/` directory.
+fall into Codabench's GENERIC fallback tier ("No additional details are
+safe to show") — loud (the submission errors) but not deeply diagnosed
+by the platform. Only `predict()` output-shape violations (NaN/inf,
+non-float, out-of-range) surface as the specific `[PAIEC-PREDICT-002]`
+code. See
+`../docs/solutions/design-patterns/codabench-two-tier-error-reporting-paiec-system-2026-05-19.md`
+for the full two-tier taxonomy. The canonical bug pattern these rules
+defend against is the April 2026 silent NCF load failure that produced
+3 weeks of constant-0.5 leaderboard signal — see the design-pattern
+docs in the parent CS321M repo's `docs/solutions/` directory.
 
 ## D-9 gate run history
 

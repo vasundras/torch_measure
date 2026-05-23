@@ -187,17 +187,26 @@ def collect_binary_examples(
     return examples
 
 
+def render_item_text(example: dict[str, Any]) -> str:
+    """Render the exact text embedded by training and runtime prediction."""
+    benchmark = str(example.get("benchmark") or "").strip()
+    condition = str(example.get("condition") or "none").strip() or "none"
+    item_content = str(example.get("item_content") or "")
+    return f"Benchmark: {benchmark}\nCondition: {condition}\nItem:\n{item_content}"
+
+
 def build_indices(examples: list[dict[str, Any]]) -> tuple[dict[str, int], dict[str, int], list[str]]:
-    """Build (subject_name -> int, item_content -> int, ordered_item_texts)."""
+    """Build subject and composite-item indices plus ordered rendered item texts."""
     subject_to_idx: dict[str, int] = {}
     item_to_idx: dict[str, int] = {}
     ordered_items: list[str] = []
     for ex in examples:
         if ex["subject_name"] not in subject_to_idx:
             subject_to_idx[ex["subject_name"]] = len(subject_to_idx)
-        if ex["item_content"] not in item_to_idx:
-            item_to_idx[ex["item_content"]] = len(item_to_idx)
-            ordered_items.append(ex["item_content"])
+        item_text = render_item_text(ex)
+        if item_text not in item_to_idx:
+            item_to_idx[item_text] = len(item_to_idx)
+            ordered_items.append(item_text)
     return subject_to_idx, item_to_idx, ordered_items
 
 
@@ -218,7 +227,7 @@ def build_long_form(
     y = np.empty(n, dtype=np.float32)
     for k, ex in enumerate(examples):
         s[k] = subject_to_idx[ex["subject_name"]]
-        i[k] = item_to_idx[ex["item_content"]]
+        i[k] = item_to_idx[render_item_text(ex)]
         y[k] = float(ex["label"])
     return torch.from_numpy(s), torch.from_numpy(i), torch.from_numpy(y)
 
@@ -416,6 +425,8 @@ def main() -> None:
         "n_items": len(item_to_idx),
         "subject_to_idx": subject_to_idx,
         "benchmarks": response_files,
+        "item_template": "Benchmark: {benchmark}\nCondition: {condition}\nItem:\n{item_content}",
+        "item_key": "benchmark||condition||item_content",
         "epochs": epochs,
         "lr": args.lr,
         "weight_decay": args.weight_decay,

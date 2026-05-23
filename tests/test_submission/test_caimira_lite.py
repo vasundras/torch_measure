@@ -10,6 +10,7 @@ resolve_subject_name handle the documented edge cases.
 
 from __future__ import annotations
 
+import math
 import sys
 from pathlib import Path
 
@@ -61,6 +62,42 @@ class TestCAIMIRALiteStateDictParity:
         assert torch.allclose(lite.relevance_head.bias, upstream.relevance_head.bias)
         assert torch.allclose(lite.difficulty_head.weight, upstream.difficulty_head.weight)
         assert torch.allclose(lite._difficulty_mean, upstream._difficulty_mean)
+
+    def test_forward_output_parity_after_state_dict_transfer(self):
+        """Per-row probabilities must match between CAIMIRA.predict_embeddings
+        and CAIMIRALite.caimira_logit after a state_dict transfer.
+
+        Key parity catches state-storage drift; forward parity catches silent
+        path drift (e.g., a future change to dynamic-vs-frozen centering in
+        one class but not the other). Without this, the silent-NCF-head-
+        load-failure class can re-emerge for CAIMIRA.
+        """
+        torch.manual_seed(0)
+        n_s, n_i, d, k = 5, 7, 16, 3
+        upstream = CAIMIRA(n_subjects=n_s, n_items=n_i, embedding_dim=d, latent_dim=k)
+        train_embeddings = torch.randn(n_i, d)
+        upstream.set_embeddings(train_embeddings)
+        with torch.no_grad():
+            upstream._difficulty_mean.fill_(0.07)
+        upstream.eval()
+
+        lite = CAIMIRALite(n_subjects=n_s, n_items=n_i, embedding_dim=d, latent_dim=k)
+        lite.load_state_dict(upstream.state_dict())
+        lite.eval()
+
+        torch.manual_seed(123)
+        for _ in range(10):
+            subj_idx = int(torch.randint(0, n_s, (1,)).item())
+            cold_emb = torch.randn(d)
+
+            upstream_p = upstream.predict_embeddings(
+                torch.tensor([subj_idx]), cold_emb.unsqueeze(0), center="frozen"
+            ).item()
+            lite_logit = lite.caimira_logit(subject_idx=subj_idx, item_embedding=cold_emb)
+            lite_p = 1.0 / (1.0 + math.exp(-lite_logit))
+            assert math.isclose(upstream_p, lite_p, abs_tol=1e-6), (
+                f"forward output diverges: upstream={upstream_p}, lite={lite_p}"
+            )
 
 
 class TestCAIMIRALiteForward:
