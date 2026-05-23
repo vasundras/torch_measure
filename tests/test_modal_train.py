@@ -119,6 +119,7 @@ def test_train_command_forwards_blend_lambdas(modal_train):  # pylint: disable=r
 def test_main_smoke_default_is_false(modal_train):
     """Without ``--smoke``, ``main`` must default to non-smoke so kind drives the plan."""
     main = modal_train.main
+    main = getattr(getattr(main, "info", None), "raw_f", main)
     sig = inspect.signature(main)
     assert sig.parameters["smoke"].default is False, (
         f"main smoke default is {sig.parameters['smoke'].default}; "

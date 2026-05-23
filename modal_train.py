@@ -188,6 +188,12 @@ if modal is not None:
             "huggingface_hub==0.24.7",
             "pyarrow==17.0.0",
             "numpy==2.0.1",
+            "pandas>=2.3",
+            "pyro-ppl>=1.8",
+            "matplotlib>=3.7",
+            "seaborn>=0.12",
+            "tueplots>=0.0.14",
+            "tabpfn>=2.2,<3",
         )
         .add_local_dir(REPO_ROOT / "src", remote_path="/root/src", copy=True)
         .add_local_dir(REPO_ROOT / "submission", remote_path="/root/submission", copy=True)
