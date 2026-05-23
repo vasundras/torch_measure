@@ -118,7 +118,7 @@ def test_cold_start_none_condition_triple_uses_ci_view():
 def test_eb_lookup_zero_subj_prior_not_overridden_by_ci_view():
     import importlib
 
-    cl = importlib.import_module("submission.caimira_lite")
+    cl = importlib.import_module("caimira_lite")
     eb = cl.EBLookup(
         sbc={},
         sb={},
@@ -136,7 +136,7 @@ def test_eb_lookup_zero_subj_prior_not_overridden_by_ci_view():
 def test_eb_lookup_zero_bench_prior_not_overridden_by_ci_view():
     import importlib
 
-    cl = importlib.import_module("submission.caimira_lite")
+    cl = importlib.import_module("caimira_lite")
     eb = cl.EBLookup(
         sbc={},
         sb={},
@@ -154,7 +154,7 @@ def test_eb_lookup_zero_bench_prior_not_overridden_by_ci_view():
 def test_eb_lookup_zero_priors_in_irt_blend_not_overridden_by_ci_view():
     import importlib
 
-    cl = importlib.import_module("submission.caimira_lite")
+    cl = importlib.import_module("caimira_lite")
     eb = cl.EBLookup(
         sbc={},
         sb={},
@@ -173,7 +173,7 @@ def test_eb_lookup_zero_priors_in_irt_blend_not_overridden_by_ci_view():
 def test_eb_lookup_none_condition_triple_uses_ci_view():
     import importlib
 
-    cl = importlib.import_module("submission.caimira_lite")
+    cl = importlib.import_module("caimira_lite")
     eb = cl.EBLookup(
         sbc={"gpt-4||mmlupro||none": 0.9},
         sb={"gpt-4||mmlupro": 0.2},

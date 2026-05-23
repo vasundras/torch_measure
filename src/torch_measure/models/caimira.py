@@ -289,8 +289,9 @@ class CAIMIRA(IRTModel):
         torch.Tensor
             Probabilities, shape ``(N,)``.
         """
-        s = query["subject_idx"]
-        i = query["item_idx"]
+        device = self._parameter_device()
+        s = query["subject_idx"].to(device=device, dtype=torch.long)
+        i = query["item_idx"].to(device=device, dtype=torch.long)
         relevance, difficulty = self.compute_item_params()
         diff = self.skill[s] - difficulty[i]
         logit = (diff * relevance[i]).sum(dim=-1)
@@ -366,6 +367,10 @@ class CAIMIRA(IRTModel):
         self._refresh_difficulty_mean()
 
         subject_idx, item_idx, response = self._normalize_fit_inputs(data, mask)
+        device = self._parameter_device()
+        subject_idx = subject_idx.to(device=device, dtype=torch.long)
+        item_idx = item_idx.to(device=device, dtype=torch.long)
+        response = response.to(device=device)
 
         def caimira_loss(probs: torch.Tensor, observed: torch.Tensor) -> torch.Tensor:
             base = bernoulli_nll(probs, observed)

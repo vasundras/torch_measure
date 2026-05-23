@@ -34,7 +34,7 @@ def lib():
 def ship():
     import importlib
 
-    return importlib.import_module("submission.caimira_lite")
+    return importlib.import_module("caimira_lite")
 
 
 @pytest.mark.parametrize("p", [0.01, 0.1, 0.5, 0.9, 0.99, 1e-9, 1 - 1e-9])

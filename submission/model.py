@@ -160,7 +160,7 @@ def _initialize_runtime(
     meta_path: Path = _META_PATH,
     eb_path: Path = _EB_PATH,
     encoder_factory: Any = None,
-    device: torch.device = DEVICE,
+    device: torch.device | None = None,
 ) -> None:
     """Load CAIMIRA + EB + encoder into module globals.
 
@@ -169,9 +169,11 @@ def _initialize_runtime(
     the production prediction path without touching the real artifact files
     or the SentenceTransformer cache.
     """
-    global META, CAIMIRA, EB, SUBJECT_TO_IDX, ENCODER, _item_cache  # noqa: PLW0603
+    global DEVICE, META, CAIMIRA, EB, SUBJECT_TO_IDX, ENCODER, _item_cache  # noqa: PLW0603
 
     _PLATT_CACHE.clear()
+    runtime_device = torch.device(device) if device is not None else torch.device(DEVICE)
+    DEVICE = runtime_device
 
     META = json.loads(Path(meta_path).read_text())
     n_subjects = int(META["n_subjects"])
@@ -184,8 +186,8 @@ def _initialize_runtime(
         n_items=n_items,
         embedding_dim=embed_dim,
         latent_dim=latent_dim,
-    ).to(device)
-    state = torch.load(Path(head_path), map_location=device, weights_only=True)
+    ).to(DEVICE)
+    state = torch.load(Path(head_path), map_location=DEVICE, weights_only=True)
     head.load_state_dict(state)
     head.eval()
     for param in head.parameters():
@@ -199,7 +201,7 @@ def _initialize_runtime(
         from sentence_transformers import SentenceTransformer
 
         encoder_factory = SentenceTransformer
-    ENCODER = _load_encoder(encoder_factory, device=str(device))
+    ENCODER = _load_encoder(encoder_factory, device=str(DEVICE))
     _item_cache = OrderedDict()
 
 

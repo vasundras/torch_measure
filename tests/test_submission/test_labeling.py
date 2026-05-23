@@ -24,7 +24,7 @@ if str(SUBMISSION_DIR) not in sys.path:
 
 @pytest.fixture(autouse=True)
 def reset_labeling_globals():
-    labeling = importlib.import_module("submission.labeling")
+    labeling = importlib.import_module("labeling")
     labeling._seen_signatures.clear()
     labeling._stratum_counts.clear()
     labeling._candidate_count = 0
@@ -132,7 +132,7 @@ def test_simhash_tokens_handle_multilingual_when_metadata_blank(text):
     ``_simhash`` falls back to ``["<empty>"]`` and every such row gets the
     same signature → zero diversity inside the round.
     """
-    labeling = importlib.reload(importlib.import_module("submission.labeling"))
+    labeling = importlib.reload(importlib.import_module("labeling"))
     ex = {
         "benchmark": "",
         "condition": "",

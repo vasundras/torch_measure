@@ -23,7 +23,7 @@ if str(SUBMISSION_DIR) not in sys.path:
 
 
 def test_training_item_key_includes_benchmark_condition_and_content():
-    train = importlib.import_module("submission.train")
+    train = importlib.import_module("train")
     examples = [
         {
             "benchmark": "bench_a",
@@ -50,7 +50,7 @@ def test_training_item_key_includes_benchmark_condition_and_content():
 
 
 def test_training_long_form_uses_composite_item_key():
-    train = importlib.import_module("submission.train")
+    train = importlib.import_module("train")
     examples = [
         {"benchmark": "b", "condition": "c1", "subject_name": "s", "item_content": "x", "label": 1.0},
         {"benchmark": "b", "condition": "c2", "subject_name": "s", "item_content": "x", "label": 0.0},
@@ -63,7 +63,7 @@ def test_training_long_form_uses_composite_item_key():
 
 def test_model_renders_benchmark_condition_item_text_for_encoder_cache(monkeypatch):
     monkeypatch.setenv("PREDICTIVE_EVAL_LOCAL_SMOKE_TEST", "1")
-    model = importlib.reload(importlib.import_module("submission.model"))
+    model = importlib.reload(importlib.import_module("model"))
 
     example = {"benchmark": "mmlu", "condition": "cot", "item_content": "What is 2+2?"}
     assert model._render_item_text(example) == "Benchmark: mmlu\nCondition: cot\nItem:\nWhat is 2+2?"
@@ -71,7 +71,7 @@ def test_model_renders_benchmark_condition_item_text_for_encoder_cache(monkeypat
 
 def test_encoder_loader_requests_local_files_only(monkeypatch):
     monkeypatch.setenv("PREDICTIVE_EVAL_LOCAL_SMOKE_TEST", "1")
-    model = importlib.reload(importlib.import_module("submission.model"))
+    model = importlib.reload(importlib.import_module("model"))
     calls = []
 
     class FakeSentenceTransformer:
@@ -99,7 +99,7 @@ def test_local_smoke_import_and_predict_do_not_need_network(monkeypatch):
         raise AssertionError("network access is forbidden in local smoke mode")
 
     monkeypatch.setattr(socket, "create_connection", fail_network)
-    model = importlib.reload(importlib.import_module("submission.model"))
+    model = importlib.reload(importlib.import_module("model"))
 
     out = model.predict(
         {
@@ -115,7 +115,7 @@ def test_local_smoke_import_and_predict_do_not_need_network(monkeypatch):
 
 def test_adaptive_calibration_fits_on_base_predictor_logits(monkeypatch):
     monkeypatch.setenv("PREDICTIVE_EVAL_LOCAL_SMOKE_TEST", "1")
-    model = importlib.reload(importlib.import_module("submission.model"))
+    model = importlib.reload(importlib.import_module("model"))
     labeled = [
         {"benchmark": "b1", "label": 1.0, "item_content": "a"},
         {"benchmark": "b1", "label": 0.0, "item_content": "b"},
@@ -136,7 +136,7 @@ def test_adaptive_calibration_fits_on_base_predictor_logits(monkeypatch):
 
 
 def test_acquisition_scores_have_1000_row_distribution():
-    labeling = importlib.reload(importlib.import_module("submission.labeling"))
+    labeling = importlib.reload(importlib.import_module("labeling"))
     scores = [
         labeling.acquisition_function(
             {

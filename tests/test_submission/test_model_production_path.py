@@ -107,8 +107,9 @@ def production_runtime(tmp_path, monkeypatch):
         )
     )
 
-    model = importlib.import_module("submission.model")
+    model = importlib.import_module("model")
     model = importlib.reload(model)
+    model.DEVICE = torch.device("meta")
     model._initialize_runtime(
         head_path=head_path,
         meta_path=meta_path,
@@ -116,6 +117,7 @@ def production_runtime(tmp_path, monkeypatch):
         encoder_factory=FakeEncoder,
         device=torch.device("cpu"),
     )
+    assert torch.device("cpu") == model.DEVICE
     return model
 
 

@@ -34,21 +34,21 @@ class TestCaimiraLiteLogitRejectsNonFinite:
     def test_nan_raises(self):
         import importlib
 
-        cl = importlib.reload(importlib.import_module("submission.caimira_lite"))
+        cl = importlib.reload(importlib.import_module("caimira_lite"))
         with pytest.raises(ValueError):
             cl._logit(float("nan"))
 
     def test_pos_inf_raises(self):
         import importlib
 
-        cl = importlib.reload(importlib.import_module("submission.caimira_lite"))
+        cl = importlib.reload(importlib.import_module("caimira_lite"))
         with pytest.raises(ValueError):
             cl._logit(float("inf"))
 
     def test_neg_inf_raises(self):
         import importlib
 
-        cl = importlib.reload(importlib.import_module("submission.caimira_lite"))
+        cl = importlib.reload(importlib.import_module("caimira_lite"))
         with pytest.raises(ValueError):
             cl._logit(float("-inf"))
 
@@ -57,7 +57,7 @@ class TestModelLogitRejectsNonFinite:
     def test_nan_raises(self):
         import importlib
 
-        model = importlib.reload(importlib.import_module("submission.model"))
+        model = importlib.reload(importlib.import_module("model"))
         with pytest.raises(ValueError):
             model._logit(float("nan"))
 

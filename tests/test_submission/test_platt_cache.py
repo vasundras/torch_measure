@@ -48,7 +48,7 @@ def _labeled() -> list[dict]:
 
 
 def test_fit_base_logit_platt_caches_across_repeated_calls():
-    model = importlib.reload(importlib.import_module("submission.model"))
+    model = importlib.reload(importlib.import_module("model"))
     counter = {"n": 0}
 
     def counting(row):
@@ -72,7 +72,7 @@ def test_fit_base_logit_platt_caches_across_repeated_calls():
 
 
 def test_fit_base_logit_platt_cache_misses_when_labeled_length_changes():
-    model = importlib.reload(importlib.import_module("submission.model"))
+    model = importlib.reload(importlib.import_module("model"))
     counter = {"n": 0}
 
     def counting(row):
@@ -142,7 +142,7 @@ def test_initialize_runtime_resets_platt_cache(tmp_path, monkeypatch):
         def encode(self, *_args, **_kwargs):
             return torch.zeros(embed_dim)
 
-    model = importlib.reload(importlib.import_module("submission.model"))
+    model = importlib.reload(importlib.import_module("model"))
     model._initialize_runtime(
         head_path=head_path,
         meta_path=meta_path,
