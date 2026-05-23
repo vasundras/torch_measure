@@ -139,12 +139,32 @@ silent NCF load failure that produced 3 weeks of constant-0.5
 leaderboard signal — see the design-pattern docs in the parent CS321M
 repo's `docs/solutions/` directory.
 
+## D-9 gate run history
+
+| Date | Artifact | Overall | (a) dist | (b) runtime | (c) stress | (d) calib | Notes |
+|---|---|---|---|---|---|---|---|
+| 2026-05-22 | smoke train (1 subj × 905 items × 5 ep) | **FAIL** | PASS | PASS | FAIL (0.759 > 0.50) | PASS | Plumbing-only run — sub-gate (b) 176/176 rows green confirms scaffolding works end-to-end; sub-gates (a)/(d) PASS but were measured on a degenerate constant-0.604 predictor (the smoke model has only `deepseek-coder-v2` in `subject_to_idx` so every validation row falls to EB Level-4/6); sub-gate (c) FAIL is expected for a barely-trained model. The CAIMIRA logit path was NEVER exercised on the audit row sample — a real-trained artifact (~909 subjects) is required for a meaningful (a)/(c)/(d) verdict. JSON output: `/tmp/d9_caimira_smoke/gate_result.json` (zip_sha256 `8d0abdea1f93…`). |
+| (pending) | full train (all binary benchmarks, ≥909 subjects) | — | — | — | — | — | Required before any Codabench upload per the postmortem-driven D-9 discipline. Will exercise the CAIMIRA+EB hybrid blend on the audit rows (in-vocab subjects). |
+
+**Important finding from the 2026-05-22 smoke run:** the D-9 gate's sub-gate (a)
+checks `mean(p) ∈ [pos_rate ± 0.05]` and `frac_extreme < 0.05` — it does NOT
+penalize mid-range constancy. A constant predictor with the right mean PASSES
+sub-gate (a). For this scaffolding, that means the smoke artifact's degenerate
+output (literally `p = 0.604` for every row, `std=1.1e-16`) did not raise the
+gate's (a) flag. This is a documented coverage gap of the gate per
+`../docs/solutions/architecture-patterns/pre-submission-transfer-audit-stress-test-gate-2026-05-22.md`
+("audit produces a TABLE, not a single pass/fail"), not a CAIMIRA-specific
+bug — but readers of the gate's PASS verdict on (a) should cross-check the
+`main_distribution` block (specifically `std` and the quantile spread) before
+treating the verdict as evidence of a well-shaped distribution.
+
 ## Open follow-ups
 
-* **D-9 transfer-audit gate has NOT been run for this scaffolding.** The
-  2026-05-22 postmortem signature (best local val_nll, worst hidden
-  score) means a CAIMIRA submission without D-9 validation is a known
-  quota-burning anti-pattern.
+* **D-9 transfer-audit gate has been smoke-run for plumbing validation
+  but NOT full-validated for transfer correctness** (see the gate run
+  history table above). The 2026-05-22 postmortem signature (best local
+  val_nll, worst hidden score) means a CAIMIRA submission without a
+  full-train D-9 PASS is a known quota-burning anti-pattern.
 * **CI lint coverage.** The repo's `.github/workflows/lint.yml:30,33`
   only runs `ruff check src/ tests/` — this `submission/` directory is
   invisible to CI lint. A follow-up should either (a) extend the lint
