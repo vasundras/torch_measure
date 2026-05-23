@@ -396,10 +396,14 @@ class ColdStartLookupPredictor:
         records: list[dict[str, Any]],
         labeled: list[dict[str, Any]] | None = None,
     ) -> list[float]:
-        """Vectorised wrapper around ``predict``. Calibration is fit once."""
-        if labeled:
-            self.calibrate(labeled)
-        return [self.predict(r) for r in records]
+        """Vectorised wrapper around ``predict``. Calibration is fit once
+        (cached by ``len(labeled)`` inside :meth:`calibrate`) and applied
+        to every record. The earlier implementation called ``calibrate``
+        here but then invoked ``self.predict(r)`` without forwarding
+        ``labeled``, so the ``if labeled:`` guard inside :meth:`predict`
+        was always false and the calibration was never applied.
+        """
+        return [self.predict(r, labeled=labeled) for r in records]
 
     # ---- Adaptive calibration --------------------------------------------
 
