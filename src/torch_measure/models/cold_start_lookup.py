@@ -323,8 +323,14 @@ class ColdStartLookupPredictor:
             return self._sb_ci[key2.lower()]
 
         # Level 3: IRT blend if both single priors are known.
-        subj_p = self.subj.get(subj_name) or self._subj_ci.get(subj_name.lower())
-        bench_p = self.bench.get(benchmark) or self._bench_ci.get(benchmark.lower())
+        # Explicit ``is None`` rather than ``or`` so a legitimate ``0.0`` prior
+        # is not short-circuited to the case-insensitive view.
+        subj_p = self.subj.get(subj_name)
+        if subj_p is None:
+            subj_p = self._subj_ci.get(subj_name.lower())
+        bench_p = self.bench.get(benchmark)
+        if bench_p is None:
+            bench_p = self._bench_ci.get(benchmark.lower())
         if subj_p is not None and bench_p is not None:
             return _clip(_sigmoid(_logit(subj_p) + _logit(bench_p) - _logit(self.global_mean)))
 
