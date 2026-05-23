@@ -45,3 +45,11 @@ data/cache/
 
 # Jupyter
 .ipynb_checkpoints/
+
+# submission/ artifacts (produced by submission/train.py; rebuildable locally,
+# too large for the repo, and partially redundant with HF-hosted weights —
+# see submission/README.md for the build flow).
+submission/caimira_lite.meta.json
+submission/eb_tables.json
+# Codabench-shaped ZIPs produced by submission/build_zip.sh at the repo root.
+/submission_*.zip
