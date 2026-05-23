@@ -61,7 +61,13 @@ _DEFAULT_PLATT_SHIFT_CAP: float = 1.5
 
 
 def _logit(p: float) -> float:
-    """Numerically safe logit. Inputs are clipped away from 0 and 1."""
+    """Numerically safe logit. Inputs are clipped away from 0 and 1.
+
+    Non-finite input (NaN, ±inf) raises ``ValueError`` rather than silently
+    collapsing to ``±16.118`` via the ``max(1e-7, min(1-1e-7, nan))`` ladder.
+    """
+    if not math.isfinite(p):
+        raise ValueError(f"_logit requires finite input, got {p!r}")
     p = max(1e-7, min(1 - 1e-7, p))
     return math.log(p / (1 - p))
 

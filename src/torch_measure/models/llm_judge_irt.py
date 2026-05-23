@@ -141,6 +141,8 @@ class LLMJudgeIRT:
 
         try:
             judge_logit = float(self.judge_fn(item_content, benchmark))
+            if not math.isfinite(judge_logit):
+                judge_logit = 0.0
         except Exception:
             judge_logit = 0.0
 
