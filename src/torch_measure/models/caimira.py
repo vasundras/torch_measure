@@ -9,7 +9,7 @@ parameters) with a multidimensional MIRT-style response equation.
 
 Reference
 ---------
-Lalor, J. P., Yang, W., Smith, K., Forde, J. Z., Resnik, P., Rodriguez, P.
+Gor, M., Daumé III, H., Zhou, T., & Boyd-Graber, J.
 "Do great minds think alike? Investigating Human-AI Complementarity in
 Question Answering with CAIMIRA." EMNLP 2024. arXiv:2410.06524.
 """
@@ -156,7 +156,11 @@ class CAIMIRA(IRTModel):
             raise ValueError(f"Expected {self.n_items} embeddings, got {embeddings.shape[0]}")
         if embeddings.shape[1] != self.embedding_dim:
             raise ValueError(f"Expected embedding_dim={self.embedding_dim}, got {embeddings.shape[1]}")
-        self._embeddings = embeddings.to(self._device)
+        self._embeddings = embeddings.to(self._parameter_device())
+
+    def _parameter_device(self) -> torch.device:
+        """Return the current module device from parameters, not constructor state."""
+        return self.skill.device
 
     def compute_item_params(
         self,
@@ -195,7 +199,7 @@ class CAIMIRA(IRTModel):
             if self._embeddings is None:
                 raise RuntimeError("Call set_embeddings() before computing item params.")
             embeddings = self._embeddings
-        embeddings = embeddings.to(self._device)
+        embeddings = embeddings.to(self._parameter_device())
 
         relevance = torch.softmax(self.relevance_head(embeddings), dim=-1)
         d_raw = self.difficulty_head(embeddings)
@@ -211,6 +215,53 @@ class CAIMIRA(IRTModel):
             raise ValueError(f"Unknown center mode {center!r}; expected 'auto', 'dynamic', or 'frozen'.")
 
         return relevance, difficulty
+
+    def predict_embeddings(
+        self,
+        subject_idx: torch.Tensor,
+        item_embeddings: torch.Tensor,
+        center: str = "frozen",
+    ) -> torch.Tensor:
+        r"""Predict probabilities for paired subject indices and item embeddings.
+
+        This is the cold-start item path: callers supply arbitrary item
+        embeddings directly instead of indices into the training bank. The
+        training-bank embeddings set by :meth:`set_embeddings` are not read or
+        mutated.
+
+        Parameters
+        ----------
+        subject_idx : torch.Tensor
+            1-D subject indices of shape ``(N,)``.
+        item_embeddings : torch.Tensor
+            2-D item embeddings of shape ``(N, embedding_dim)``.
+        center : {"auto", "dynamic", "frozen"}, optional
+            Difficulty-centering mode. Defaults to ``"frozen"`` for
+            cold-start inference.
+
+        Returns
+        -------
+        torch.Tensor
+            Probabilities, shape ``(N,)``.
+        """
+        if subject_idx.dim() != 1:
+            raise ValueError(f"Expected 1-D subject_idx, got shape {tuple(subject_idx.shape)}")
+        if item_embeddings.dim() != 2:
+            raise ValueError(f"Expected 2-D item_embeddings, got shape {tuple(item_embeddings.shape)}")
+        if item_embeddings.shape[0] != subject_idx.shape[0]:
+            raise ValueError(
+                "subject_idx and item_embeddings must have matching first dimension "
+                f"({subject_idx.shape[0]} != {item_embeddings.shape[0]})"
+            )
+        if item_embeddings.shape[1] != self.embedding_dim:
+            raise ValueError(f"Expected embedding_dim={self.embedding_dim}, got {item_embeddings.shape[1]}")
+
+        device = self._parameter_device()
+        subject_idx = subject_idx.to(device=device, dtype=torch.long)
+        relevance, difficulty = self.compute_item_params(item_embeddings, center=center)
+        diff = self.skill[subject_idx] - difficulty
+        logit = (diff * relevance).sum(dim=-1)
+        return torch.sigmoid(logit)
 
     def _refresh_difficulty_mean(self) -> None:
         """Snapshot the current training-bank difficulty mean into the buffer."""

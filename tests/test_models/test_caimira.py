@@ -148,6 +148,46 @@ class TestCAIMIRA:
         assert probs.shape == (5,)
         assert torch.allclose(probs, manual, atol=1e-6)
 
+    def test_predict_embeddings_scores_cold_start_items_with_frozen_centering(self):
+        """Cold-start item embeddings should score without mutating the training bank."""
+        torch.manual_seed(0)
+        n_subjects, n_items, embed, latent = 4, 6, 8, 3
+        model = CAIMIRA(n_subjects=n_subjects, n_items=n_items, embedding_dim=embed, latent_dim=latent)
+        train_embeddings = torch.randn(n_items, embed)
+        model.set_embeddings(train_embeddings)
+        with torch.no_grad():
+            model._difficulty_mean.fill_(0.25)
+        model.eval()
+
+        subject_idx = torch.tensor([0, 1, 2, 3])
+        cold_embeddings = torch.randn(4, embed)
+        probs = model.predict_embeddings(subject_idx, cold_embeddings, center="frozen")
+
+        relevance, difficulty = model.compute_item_params(cold_embeddings, center="frozen")
+        manual = torch.sigmoid(((model.skill[subject_idx] - difficulty) * relevance).sum(dim=-1))
+        assert probs.shape == (4,)
+        assert torch.allclose(probs, manual, atol=1e-6)
+        assert model._embeddings is not None
+        assert torch.allclose(model._embeddings, train_embeddings)
+
+    def test_difficulty_mean_buffer_survives_state_dict_roundtrip(self):
+        """The frozen centering buffer is part of the deployable state_dict."""
+        model = CAIMIRA(n_subjects=3, n_items=5, embedding_dim=7, latent_dim=2)
+        with torch.no_grad():
+            model._difficulty_mean.copy_(torch.tensor([0.3, -0.2]))
+        clone = CAIMIRA(n_subjects=3, n_items=5, embedding_dim=7, latent_dim=2)
+        clone.load_state_dict(model.state_dict())
+        assert torch.allclose(clone._difficulty_mean, torch.tensor([0.3, -0.2]))
+
+    def test_embedding_paths_follow_parameter_device_after_to(self):
+        """Embedding inputs should follow the module's actual parameter device after .to()."""
+        model = CAIMIRA(n_subjects=3, n_items=5, embedding_dim=7, latent_dim=2)
+        model.to("meta")
+        embeddings = torch.empty(5, 7)
+        model.set_embeddings(embeddings)
+        assert model._embeddings is not None
+        assert model._embeddings.device.type == "meta"
+
     def test_fit_reduces_loss(self, small_response_matrix):
         torch.manual_seed(0)
         n_subjects, n_items = small_response_matrix.shape
