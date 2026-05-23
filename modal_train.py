@@ -78,6 +78,21 @@ def default_run_id(kind: str, latent_dim: int, seed: int, epochs: int) -> str:
     return f"modal_light_caimira_m{latent_dim}_seed{seed}_ep{epochs}_{kind}_{stamp}"
 
 
+def _resolve_smoke_and_epochs(kind: str, smoke: bool, epochs: int) -> tuple[bool, int]:
+    """Reconcile ``kind`` / ``smoke`` / ``epochs`` into a coherent plan.
+
+    ``kind="smoke"`` forces ``smoke=True`` and caps ``epochs`` at 5; the
+    smoke-kind contract is "fast plumbing check, ignore caller's training
+    config". ``kind="train"`` preserves the caller's explicit ``smoke``
+    value so an operator can still opt into ``--kind train --smoke`` if
+    they want the train code path with a smoke dataset, but a plain
+    ``--kind train`` does not silently downgrade to smoke mode.
+    """
+    if kind == "smoke":
+        return True, min(epochs, 5)
+    return smoke, epochs
+
+
 def sha256_file(path: Path) -> str:
     h = hashlib.sha256()
     with path.open("rb") as fh:
@@ -331,7 +346,7 @@ if modal is not None:
         seed: int = 42,
         epochs: int = 5,
         lr: float = 1e-3,
-        smoke: bool = True,
+        smoke: bool = False,
         benchmarks: str = "",
         blend_lambdas: str = "0.0,0.5,0.6,0.9,1.0",
         dry_run: bool = False,
@@ -340,9 +355,7 @@ if modal is not None:
         assert_no_codabench_capability()
         if kind not in {"smoke", "train"}:
             raise ValueError("--kind must be smoke or train")
-        if kind == "smoke":
-            smoke = True
-            epochs = min(epochs, 5)
+        smoke, epochs = _resolve_smoke_and_epochs(kind, smoke, epochs)
         run_id = validate_run_id(run_id or default_run_id(kind, latent_dim, seed, epochs))
         bench_list = [part for part in benchmarks.split(",") if part]
         lambda_list = [float(part) for part in blend_lambdas.split(",") if part]
@@ -399,7 +412,7 @@ def cli(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     assert_no_codabench_capability()
     kind = args.kind
-    epochs = min(args.epochs, 5) if kind == "smoke" else args.epochs
+    smoke, epochs = _resolve_smoke_and_epochs(kind, args.smoke, args.epochs)
     run_id = validate_run_id(args.run_id or default_run_id(kind, args.latent_dim, args.seed, epochs))
     plan = {
         "run_id": run_id,
@@ -408,7 +421,7 @@ def cli(argv: list[str] | None = None) -> int:
         "seed": args.seed,
         "epochs": epochs,
         "lr": args.lr,
-        "smoke": args.smoke or kind == "smoke",
+        "smoke": smoke,
         "benchmarks": [part for part in args.benchmarks.split(",") if part],
         "blend_lambdas": [float(part) for part in args.blend_lambdas.split(",") if part],
         "modal_available": modal is not None,
