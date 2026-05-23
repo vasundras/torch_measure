@@ -169,6 +169,8 @@ def _initialize_runtime(
     """
     global META, CAIMIRA, EB, SUBJECT_TO_IDX, ENCODER, _item_cache  # noqa: PLW0603
 
+    _PLATT_CACHE.clear()
+
     META = json.loads(Path(meta_path).read_text())
     n_subjects = int(META["n_subjects"])
     n_items = int(META["n_items"])
@@ -259,11 +261,31 @@ def _base_predict_probability(ex: dict) -> float:
     return _blend_logits(caimira_p, eb_p, _BLEND_LAMBDA)
 
 
+_PLATT_CACHE: dict[int, dict[str, tuple[float, float]]] = {}
+
+
 def _fit_base_logit_platt(
     labeled: list[dict],
     base_predictor: Any,
 ) -> dict[str, tuple[float, float]]:
-    """Fit intercept-only Platt shifts on actual base predictor logits."""
+    """Fit intercept-only Platt shifts on actual base predictor logits.
+
+    Cached by ``len(labeled)`` to avoid recomputing the Platt fit on every
+    ``predict()`` call in the round. The platform sends the same labeled
+    list throughout a round; recomputing the fit per hidden item is wasted
+    work and (more importantly) triggers ``base_predictor`` per labeled
+    row per hidden item — a CAIMIRA forward + EB lookup blow-up. Matches
+    the ``self._platt_fit_key = len(labeled)`` caching in
+    :meth:`torch_measure.models.cold_start_lookup.ColdStartLookupPredictor.calibrate`
+    and :meth:`submission.caimira_lite.EBLookup.fit_platt`. The cache is
+    cleared by :func:`_initialize_runtime` so test re-inits do not leak
+    stale entries.
+    """
+    cache_key = len(labeled)
+    cached = _PLATT_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
     by_benchmark: dict[str, list[tuple[float, float]]] = {}
     for row in labeled:
         benchmark = (row.get("benchmark") or "").strip()
@@ -288,6 +310,7 @@ def _fit_base_logit_platt(
         mean_x = sum(x for x, _label in pairs) / len(pairs)
         intercept = max(-1.5, min(1.5, _logit(mean_y) - mean_x))
         platt[benchmark] = (1.0, intercept)
+    _PLATT_CACHE[cache_key] = platt
     return platt
 
 
