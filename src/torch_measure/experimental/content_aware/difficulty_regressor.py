@@ -55,8 +55,15 @@ from sklearn.linear_model import Ridge, Lasso
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.metrics import roc_auc_score
 from sentence_transformers import SentenceTransformer
-import lightgbm as lgb
-import xgboost as xgb
+try:
+    import lightgbm as lgb
+except ImportError:  # pragma: no cover
+    lgb = None
+
+try:
+    import xgboost as xgb
+except ImportError:  # pragma: no cover
+    xgb = None
 
 from torch_measure.experimental.content_aware.mlp_regressor import MLPRegressor
 
