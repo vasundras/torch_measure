@@ -353,8 +353,12 @@ def build_model(model_name: str, params: dict):
     elif model_name == "lasso":
         return Lasso(**params)
     elif model_name == "lgbm":
+        if lgb is None:
+            raise ImportError("model_name='lgbm' requires lightgbm; install it separately to use this regressor")
         return lgb.LGBMRegressor(**params)
     elif model_name == "xgboost":
+        if xgb is None:
+            raise ImportError("model_name='xgboost' requires xgboost; install it separately to use this regressor")
         return xgb.XGBRegressor(**params, verbosity=0)
     elif model_name == "random_forest":
         return RandomForestRegressor(**params, n_jobs=-1)
