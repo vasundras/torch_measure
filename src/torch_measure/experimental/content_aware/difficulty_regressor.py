@@ -50,7 +50,7 @@ experimental log.
 import numpy as np
 import pandas as pd
 import torch
-import torch.nn as nn
+import torch
 from sklearn.linear_model import Ridge, Lasso
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.metrics import roc_auc_score
