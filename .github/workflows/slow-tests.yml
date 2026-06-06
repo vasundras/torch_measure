@@ -1,8 +1,10 @@
 name: Slow tests
 
-# Runs the full test suite including slow-marked tests (e.g. TabPFN) on a
-# weekly schedule. Surfaces breakage in code paths that the regular CI loop
-# (which filters with `-m "not slow"`) would never exercise.
+# Runs the full test suite including slow-marked tests (e.g. TabPFN, the
+# submission/train.py end-to-end smoke) on a weekly schedule. Surfaces
+# breakage in code paths that the regular CI loop (which filters with
+# `-m "not slow and not network"`) would never exercise. Network access
+# is required for the HuggingFace pulls in `tests/test_submission/test_train_smoke.py`.
 
 on:
   schedule:
